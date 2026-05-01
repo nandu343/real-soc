@@ -31,6 +31,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	memdump "github.com/nandu343/real-soc/internal/tools/memdump"
+	qtool "github.com/nandu343/real-soc/internal/tools/query"
 	yaraengine "github.com/nandu343/real-soc/internal/tools/yara"
 )
 
@@ -340,6 +341,21 @@ func RegisterBuiltinTools(r *ToolRegistry) {
 				"strings": strs,
 				"status":  "ok",
 			}, nil
+		},
+	})
+
+	r.Register(&Tool{
+		Name:        "query",
+		Description: "Query local Elasticsearch or Splunk instances.",
+		Params: []ToolParam{
+			{Name: "backend", Type: "string", Description: "elasticsearch|splunk (optional)", Required: false},
+			{Name: "query", Type: "string", Description: "Query string", Required: true},
+			{Name: "index", Type: "string", Description: "Elasticsearch index (required for ES)", Required: false},
+			{Name: "size", Type: "number", Description: "Max results (ES)", Required: false},
+			{Name: "count", Type: "number", Description: "Max results (Splunk)", Required: false},
+		},
+		Handler: func(ctx context.Context, params map[string]any) (any, error) {
+			return qtool.RunQuery(ctx, params)
 		},
 	})
 
