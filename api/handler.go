@@ -34,6 +34,11 @@ type Store interface {
 	ListAgentCards() ([]models.AgentCard, error)
 	// ListPausedForHuman returns workflow states currently awaiting human input.
 	ListPausedForHuman() ([]models.WorkflowState, error)
+	// Persistent agent registry operations
+	SaveAgent(*models.AgentRecord) error
+	GetAgentByID(string) (*models.AgentRecord, error)
+	ListRegisteredAgents() ([]models.AgentRecord, error)
+	DeleteAgent(string) error
 }
 
 // TemporalClient defines the subset of the Temporal client used by handlers.
@@ -66,6 +71,7 @@ func (h *Handler) Register(app *fiber.App) {
 	v1.Get("/workflows/:id", h.GetWorkflow)
 	v1.Get("/workflows/:id/snapshots", h.ListSnapshots)
 	v1.Get("/agents", h.ListAgents)
+	v1.Post("/agents", h.RegisterAgent)
 	v1.Get("/workflows/:id/query", h.QueryWorkflow)
 	v1.Get("/inbox", h.Inbox)
 	v1.Post("/workflows/:id/approve", h.ApproveStep)
@@ -75,11 +81,49 @@ func (h *Handler) Register(app *fiber.App) {
 
 // ListAgents returns the distinct AgentCard registry discovered in the DB.
 func (h *Handler) ListAgents(c *fiber.Ctx) error {
+	// Prefer explicit registry entries; fall back to discovered cards if empty.
+	regs, err := h.store.ListRegisteredAgents()
+	if err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	if len(regs) > 0 {
+		return c.JSON(regs)
+	}
+
+	// If the registry is empty, return the aggregated agent cards discovered
+	// in existing WorkflowState documents for backwards compatibility.
 	cards, err := h.store.ListAgentCards()
 	if err != nil {
 		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
 	}
 	return c.JSON(cards)
+}
+
+// RegisterAgent accepts an AgentCard-like JSON payload and persists it to the
+// orchestrator registry so the dashboard and other clients can discover it.
+func (h *Handler) RegisterAgent(c *fiber.Ctx) error {
+	var card models.AgentCard
+	if err := c.BodyParser(&card); err != nil {
+		return fiber.NewError(http.StatusBadRequest, "invalid JSON body: "+err.Error())
+	}
+	if card.AgentID == "" {
+		return fiber.NewError(http.StatusBadRequest, "agent_id is required")
+	}
+
+	rec := models.AgentRecord{
+		AgentID:      card.AgentID,
+		Image:        card.Image,
+		Endpoint:     card.Endpoint,
+		Auth:         card.Auth,
+		Type:         card.Type,
+		Capabilities: card.Capabilities,
+		Outbound:     card.Outbound,
+	}
+
+	if err := h.store.SaveAgent(&rec); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	return c.Status(http.StatusCreated).JSON(rec)
 }
 
 // --------------------------------------------------------------------------

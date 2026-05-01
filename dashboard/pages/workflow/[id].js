@@ -1,11 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
-import dynamic from 'next/dynamic'
+import JsonDiff from '../../components/JsonDiff'
 import Link from 'next/link'
 import NodePalette from '../../components/NodePalette'
 import NodeCanvas from '../../components/NodeCanvas'
 import generateWorkflow from '../../utils/generateWorkflow'
-
-const DiffViewer = dynamic(() => import('react-diff-viewer'), { ssr: false })
 
 export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId }){
   const [question, setQuestion] = useState('')
@@ -15,6 +13,9 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
   // Canvas state
   const [canvasNodes, setCanvasNodes] = useState([])
   const [canvasEdges, setCanvasEdges] = useState([])
+  const [flowName, setFlowName] = useState('')
+  const [savedFlows, setSavedFlows] = useState([])
+  const [showSaved, setShowSaved] = useState(false)
 
   // Running workflow being polled for Pulse
   const [runningWorkflowId, setRunningWorkflowId] = useState(null)
@@ -39,6 +40,54 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
   function handleCanvasChange({ nodes, edges }){
     setCanvasNodes(nodes)
     setCanvasEdges(edges)
+  }
+
+  // Local flow persistence (localStorage key: real-soc:flows)
+  const loadSavedFlows = ()=>{
+    try{
+      const arr = JSON.parse(localStorage.getItem('real-soc:flows')||'[]')
+      setSavedFlows(arr || [])
+    }catch(err){ setSavedFlows([]) }
+  }
+
+  useEffect(()=>{ if(typeof window !== 'undefined') loadSavedFlows() }, [])
+
+  const saveFlowToLocal = ()=>{
+    if(!flowName || flowName.trim()===''){ alert('Please enter a flow name'); return }
+    const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('flow-'+Date.now())
+    const item = { id, name: flowName, nodes: canvasNodes, edges: canvasEdges, createdAt: new Date().toISOString() }
+    const existing = JSON.parse(localStorage.getItem('real-soc:flows')||'[]')
+    existing.unshift(item)
+    localStorage.setItem('real-soc:flows', JSON.stringify(existing))
+    setSavedFlows(existing)
+    setFlowName('')
+    alert('Saved flow')
+  }
+
+  const loadFlow = (f)=>{
+    if(!f) return
+    setCanvasNodes(f.nodes || [])
+    setCanvasEdges(f.edges || [])
+    setShowSaved(false)
+    alert('Loaded flow: '+(f.name||f.id))
+  }
+
+  const deleteFlow = (id)=>{
+    const remaining = (savedFlows || []).filter(s=>s.id!==id)
+    localStorage.setItem('real-soc:flows', JSON.stringify(remaining))
+    setSavedFlows(remaining)
+  }
+
+  const downloadFlow = (f)=>{
+    const blob = new Blob([JSON.stringify(f, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = (f.name || 'flow') + '.json'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
   }
 
   async function generateAndStart(){
@@ -123,10 +172,16 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
     setLoading(true)
     setChatAnswer(null)
     try{
+      const wid = workflow?.workflow_id || workflow?.WorkflowID || workflow?.workflowId || workflowId
+      if(!wid || wid === 'new'){
+        setChatAnswer('Cannot chat: workflow not started or open a saved workflow first.')
+        setLoading(false)
+        return
+      }
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ workflowId: workflow.workflow_id || workflow.workflowID || workflow.workflowId || workflow.workflowID, question })
+        body: JSON.stringify({ workflowId: wid, question })
       })
       const data = await res.json()
       setChatAnswer(data.answer)
@@ -169,11 +224,11 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
   }
 
   return (
-    <div className="min-h-screen bg-white p-8">
+    <div className="min-h-screen bg-amber-50 p-8 text-slate-800">
       <div className="max-w-7xl mx-auto">
         <div className="flex items-center justify-between mb-6">
-          <h1 className="text-2xl font-semibold">Workflow: {workflow.workflow_id || workflow.WorkflowID || workflow.workflowID || 'unknown'}</h1>
-          <Link href="/"><a className="text-sm text-slate-500">← Back</a></Link>
+          <h1 className="text-2xl font-semibold">Workflow: {workflow?.workflow_id || workflow?.WorkflowID || workflow?.workflowID || (workflowId === 'new' ? 'New Flow (unsaved)' : 'unknown')}</h1>
+          <Link href="/" className="text-sm text-amber-700">← Back</Link>
         </div>
 
         <div className="flex gap-4">
@@ -182,11 +237,37 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
             <div className="flex gap-4">
               <div className="flex-1">
                 <div className="flex items-center gap-2 mb-2">
-                  <button onClick={generateAndStart} className="bg-sky-600 text-white px-4 py-2 rounded">Generate & Start</button>
-                  <button onClick={()=>{ navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(generateWorkflow(canvasNodes, canvasEdges), null, 2)); alert('workflow JSON copied') }} className="bg-gray-200 px-3 py-2 rounded">Copy JSON</button>
+                  <button onClick={generateAndStart} className="bg-amber-600 text-white px-4 py-2 rounded">Generate & Start</button>
+                  <button onClick={()=>{ navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(generateWorkflow(canvasNodes, canvasEdges), null, 2)); alert('workflow JSON copied') }} className="bg-amber-200 px-3 py-2 rounded">Copy JSON</button>
                   <div className="text-sm text-slate-500">Tip: click a node then another to connect.</div>
                 </div>
-                <NodeCanvas onChange={handleCanvasChange} activeTaskId={activeTaskId} failedTaskErrors={failedMap} />
+
+                <div className="flex items-center gap-2 mb-4">
+                  <input value={flowName} onChange={(e)=>setFlowName(e.target.value)} placeholder="Flow name" className="border rounded p-2" />
+                  <button onClick={saveFlowToLocal} className="bg-amber-200 px-3 py-2 rounded">Save Flow</button>
+                  <button onClick={()=>setShowSaved(!showSaved)} className="bg-amber-50 border px-3 py-2 rounded">Saved Flows ({savedFlows.length})</button>
+                </div>
+
+                {showSaved && (
+                  <div className="mb-4 border rounded p-2 bg-white max-h-52 overflow-auto">
+                    {(savedFlows||[]).length===0 && (<div className="text-sm text-slate-500">No saved flows</div>)}
+                    {(savedFlows||[]).map(f => (
+                      <div key={f.id} className="flex items-center justify-between gap-2 p-2 border-b last:border-b-0">
+                        <div className="text-sm">
+                          <div className="font-medium">{f.name}</div>
+                          <div className="text-xs text-slate-500">{f.createdAt}</div>
+                        </div>
+                        <div className="flex gap-2">
+                            <button onClick={()=>loadFlow(f)} className="px-2 py-1 bg-emerald-600 text-white rounded text-sm">Load</button>
+                            <button onClick={()=>downloadFlow(f)} className="px-2 py-1 bg-amber-600 text-white rounded text-sm">Download</button>
+                            <button onClick={()=>deleteFlow(f.id)} className="px-2 py-1 bg-red-600 text-white rounded text-sm">Delete</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <NodeCanvas initialNodes={canvasNodes} initialEdges={canvasEdges} onChange={handleCanvasChange} activeTaskId={activeTaskId} failedTaskErrors={failedMap} />
               </div>
               <div className="w-1/2">
                 <section className="mb-6">
@@ -196,7 +277,7 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
 
                 <section className="mb-6">
                   <h2 className="font-medium">Snapshots (Emit / Restore)</h2>
-                  <div className="mt-2 border rounded p-2 bg-slate-50 max-h-48 overflow-auto">
+                  <div className="mt-2 border rounded p-2 bg-amber-50 max-h-48 overflow-auto">
                     {(!snapshots || snapshots.length===0) && (<div className="text-sm text-slate-500">No snapshots found.</div>)}
                     {(snapshots||[]).map(s => (
                       <div key={s.id} className="p-2 border-b last:border-b-0 flex items-start justify-between gap-2">
@@ -205,7 +286,7 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
                           <div className="text-slate-600 truncate">{s.created_at || s.createdAt}</div>
                         </div>
                         <div className="flex gap-2">
-                          <button onClick={()=>emitSnapshot(s)} className="bg-sky-600 text-white px-3 py-1 rounded text-sm">Emit</button>
+                          <button onClick={()=>emitSnapshot(s)} className="bg-amber-600 text-white px-3 py-1 rounded text-sm">Emit</button>
                           <button onClick={()=>restoreSnapshot(s)} className="bg-amber-600 text-white px-3 py-1 rounded text-sm">Restore</button>
                         </div>
                       </div>
@@ -215,10 +296,10 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
 
                 <section className="mb-6">
                   <h2 className="font-medium">JSON Diff (previous → current)</h2>
-                  <div className="mt-2 border rounded p-2 bg-slate-50">
+                    <div className="mt-2 border rounded p-2 bg-amber-50">
                     {prev ? (
                       <div style={{width:'100%'}}>
-                        <DiffViewer oldValue={prevPretty} newValue={latestPretty} splitView={true} />
+                        <JsonDiff oldValue={prev} newValue={latest} />
                       </div>
                     ) : (
                       <div className="text-sm text-slate-500">No previous snapshot to diff against.</div>
@@ -228,14 +309,14 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
 
                 <section className="mb-6">
                   <h2 className="font-medium">Review & Approve</h2>
-                  <div className="mt-2 border rounded p-4 bg-slate-50">
+                    <div className="mt-2 border rounded p-4 bg-amber-50">
                     <div className="grid grid-cols-1 gap-2 md:grid-cols-3 mb-2">
                       <input value={reviewer} onChange={(e)=>setReviewer(e.target.value)} placeholder="Reviewer name*" className="border rounded p-2" />
                       <input value={comment} onChange={(e)=>setComment(e.target.value)} placeholder="Comment (optional)" className="border rounded p-2" />
                       <div className="flex gap-2">
                         <button onClick={()=>sendApproval(true)} disabled={approveLoading} className="bg-emerald-600 text-white px-4 py-2 rounded">Approve</button>
                         <button onClick={()=>sendApproval(false)} disabled={approveLoading} className="bg-red-600 text-white px-4 py-2 rounded">Reject</button>
-                        <button onClick={()=>{ setShowEditor(!showEditor); setEditedStateText(latestPretty) }} className="bg-gray-200 px-4 py-2 rounded">{showEditor ? 'Close Editor' : 'Edit State'}</button>
+                        <button onClick={()=>{ setShowEditor(!showEditor); setEditedStateText(latestPretty) }} className="bg-amber-200 px-4 py-2 rounded">{showEditor ? 'Close Editor' : 'Edit State'}</button>
                       </div>
                     </div>
 
@@ -294,6 +375,11 @@ export async function getServerSideProps(ctx){
     }catch(err){
       return null
     }
+  }
+
+  // If creating a new flow in the UI, skip fetching from the API
+  if(id === 'new'){
+    return { props: { workflow: null, snapshots: [], apiBase, workflowId: id } }
   }
 
   const workflow = await fetchState(`${apiBase}/workflows/${encodeURIComponent(id)}`)

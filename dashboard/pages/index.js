@@ -11,9 +11,8 @@ export default function Home(){
 
         <div className="flex gap-2">
           <input value={id} onChange={(e)=>setId(e.target.value)} placeholder="workflow id (e.g. soc-pipeline-local-test)" className="flex-1 border rounded p-2" />
-          <Link href={`/workflow/${encodeURIComponent(id)}`}>
-            <a className="bg-sky-600 text-white px-4 py-2 rounded">Open</a>
-          </Link>
+          <Link href={`/workflow/${encodeURIComponent(id)}`} className="bg-sky-600 text-white px-4 py-2 rounded">Open</Link>
+          <Link href={`/workflow/new`} className="bg-emerald-600 text-white px-4 py-2 rounded">Create New</Link>
         </div>
 
         <div className="mt-8 text-sm text-slate-500">

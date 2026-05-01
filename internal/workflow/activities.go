@@ -7,8 +7,14 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"time"
 
 	"github.com/nandu343/real-soc/internal/db"
@@ -21,7 +27,7 @@ import (
 // Activities bundles all dependencies needed by the activity functions.
 // A single instance is registered with the Temporal worker at startup.
 type Activities struct {
-	Runner *runner.DockerRunner
+	Runner runner.Runner
 	Store  *db.Store
 }
 
@@ -38,6 +44,20 @@ type RunAgentInput struct {
 
 // RunAgentOutput carries the result from the RunAgent activity.
 type RunAgentOutput struct {
+	UpdatedState *models.WorkflowState
+	Artifact     models.Artifact
+	Logs         string
+}
+
+// CallAPIInput carries the parameters for executing a generic API node.
+type CallAPIInput struct {
+	State     *models.WorkflowState
+	AgentCard models.AgentCard
+	TaskIndex int
+}
+
+// CallAPIOutput carries the result from an API call activity.
+type CallAPIOutput struct {
 	UpdatedState *models.WorkflowState
 	Artifact     models.Artifact
 	Logs         string
@@ -108,6 +128,137 @@ func (a *Activities) RunAgent(ctx context.Context, input RunAgentInput) (RunAgen
 		Artifact:     out.Artifact,
 		Logs:         out.Logs,
 	}, nil
+}
+
+// CallAPI performs an HTTP request for an `api` node. It sends the task
+// input as JSON payload to the configured AgentCard.Endpoint and expects
+// an application/json response which will be stored in the task's Output.
+func (a *Activities) CallAPI(ctx context.Context, input CallAPIInput) (CallAPIOutput, error) {
+	baseLogger := activity.GetLogger(ctx)
+	var logger templog.Logger
+	if wl, ok := baseLogger.(templog.WithLogger); ok {
+		logger = wl.With("trace_id", input.State.TraceID)
+	} else {
+		logger = baseLogger
+	}
+
+	logger.Info("CallAPI started",
+		"agent", input.AgentCard.AgentID,
+		"endpoint", input.AgentCard.Endpoint,
+		"task_index", input.TaskIndex,
+	)
+
+	activity.RecordHeartbeat(ctx, "calling api")
+
+	// Persist a before snapshot for time-travel/audit.
+	if err := a.Store.SaveSnapshot(input.State, input.TaskIndex, "before_api"); err != nil {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: save snapshot (before): %w", err)
+	}
+
+	// Build request method and headers from task input and agent card.
+	method := "POST"
+	headers := map[string]string{"Content-Type": "application/json", "User-Agent": "real-soc-api-node/1.0"}
+	if input.State.Tasks[input.TaskIndex].Input != nil {
+		if m, ok := input.State.Tasks[input.TaskIndex].Input["_method"].(string); ok && m != "" {
+			method = m
+		}
+		if hh, ok := input.State.Tasks[input.TaskIndex].Input["_headers"].(map[string]any); ok {
+			for k, v := range hh {
+				headers[k] = fmt.Sprint(v)
+			}
+		}
+	}
+	// AgentCard auth (bearer) takes precedence if present.
+	if input.AgentCard.Auth != nil {
+		if b, ok := input.AgentCard.Auth["bearer"].(string); ok && b != "" {
+			headers["Authorization"] = "Bearer " + b
+		}
+	}
+
+	if input.AgentCard.Endpoint == "" {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: agent %s has no endpoint configured", input.AgentCard.AgentID)
+	}
+
+	// Prepare body payload: copy task input minus control fields.
+	bodyMap := map[string]any{}
+	if input.State.Tasks[input.TaskIndex].Input != nil {
+		for k, v := range input.State.Tasks[input.TaskIndex].Input {
+			if k == "_method" || k == "_headers" {
+				continue
+			}
+			bodyMap[k] = v
+		}
+	}
+
+	bodyBytes, err := json.Marshal(bodyMap)
+	if err != nil {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: marshal body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, input.AgentCard.Endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: new request: %w", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: remote returned status %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(respBytes, &parsed); err != nil {
+		parsed = map[string]any{"text": string(respBytes)}
+	}
+
+	// Update state with output
+	updated := input.State
+	if updated.Tasks == nil || input.TaskIndex < 0 || input.TaskIndex >= len(updated.Tasks) {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: invalid task index %d", input.TaskIndex)
+	}
+	updated.Tasks[input.TaskIndex].Output = parsed
+	updated.Tasks[input.TaskIndex].Status = "completed"
+	updated.Tasks[input.TaskIndex].Confidence = 1.0
+
+	// Compute checksum and create artifact
+	sum := sha256.Sum256(respBytes)
+	checksum := hex.EncodeToString(sum[:])
+	artifact := models.Artifact{
+		ArtifactID: fmt.Sprintf("api-%d", time.Now().UnixNano()),
+		ProducedBy: input.AgentCard.AgentID,
+		Name:       "api-response.json",
+		MimeType:   "application/json",
+		URI:        fmt.Sprintf("%s#response", input.AgentCard.Endpoint),
+		Checksum:   checksum,
+	}
+
+	updated.Artifacts = append(updated.Artifacts, artifact)
+	updated.UpdatedAt = time.Now().UTC()
+
+	if err := a.Store.Save(updated); err != nil {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: save state: %w", err)
+	}
+
+	if err := a.Store.SaveSnapshot(updated, input.TaskIndex, "after_api"); err != nil {
+		return CallAPIOutput{}, fmt.Errorf("activity CallAPI: save snapshot (after): %w", err)
+	}
+
+	logger.Info("CallAPI completed", "agent", input.AgentCard.AgentID, "status", resp.StatusCode)
+
+	return CallAPIOutput{UpdatedState: updated, Artifact: artifact, Logs: string(respBytes)}, nil
 }
 
 // --------------------------------------------------------------------------

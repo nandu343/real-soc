@@ -10,7 +10,7 @@ Quick start (local development):
 
 ```bash
 cd dashboard
-npm install
+npm install --legacy-peer-deps
 ```
 
 2. Set environment variables for the orchestrator API and LLM backend:
@@ -28,3 +28,12 @@ npm run dev
 ```
 
 Open http://localhost:3001 and enter a workflow id.
+
+Notes:
+- The dashboard uses `jsondiffpatch` to compute JSON diffs and render a compact delta view.
+- If you previously relied on `react-diff-viewer`, it has been removed for React 18 compatibility.
+
+Local agents & human agent template:
+- The Node Palette can fetch agents from the orchestrator (`/api/v1/agents`). If none are present, use the "Create" button in the palette to add a local agent stored in `localStorage`.
+- Use the "Add Human" quick button to insert a preconfigured human analyst agent (type `human`) which pauses workflows for manual input.
+- Local agents are persisted to `localStorage` under the key `real-soc:local_agents` and can be deleted or exported from the palette UI.

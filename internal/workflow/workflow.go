@@ -232,10 +232,9 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 			continue
 		}
 
-		// Execute the agent container via the RunAgent activity.
-		// Allow per-task control of how hangs are handled via `TaskObject.OnHang`.
-		// If OnHang == "escalate" we set MaximumAttempts=1 so the workflow
-		// immediately receives the failure and can escalate to a human.
+		// Execute the agent. For `api` typed AgentCards we perform a generic
+		// HTTP call activity (CallAPI). Otherwise we use the RunAgent activity
+		// which drives container-based or remote-agent runners.
 		maxAttempts := int32(3)
 		if task.OnHang == "escalate" {
 			maxAttempts = 1
@@ -252,78 +251,133 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 		}
 		actCtx := workflow.WithActivityOptions(ctx, activityOptions)
 
-		var agentOut RunAgentOutput
-		err = workflow.ExecuteActivity(actCtx, (*Activities).RunAgent, RunAgentInput{
-			State:     state,
-			AgentCard: card,
-			TaskIndex: i,
-		}).Get(actCtx, &agentOut)
-		if err != nil {
-			// If the task is configured to escalate on hang/failure, move to
-			// the Human-in-the-Loop approval flow instead of failing the run.
-			if task.OnHang == "escalate" {
-				logger.Info("escalating task to HITL due to activity error", "task", task.Name, "error", err)
+		// Branch for API nodes
+		if strings.EqualFold(card.Type, "api") || strings.EqualFold(card.Type, "http") {
+			var apiOut CallAPIOutput
+			err = workflow.ExecuteActivity(actCtx, (*Activities).CallAPI, CallAPIInput{
+				State:     state,
+				AgentCard: card,
+				TaskIndex: i,
+			}).Get(actCtx, &apiOut)
+			if err != nil {
+				if task.OnHang == "escalate" {
+					logger.Info("escalating task to HITL due to activity error", "task", task.Name, "error", err)
 
-				task.Status = "awaiting_approval"
-				task.Error = err.Error()
-				state.Status = "awaiting_approval"
-				if err2 := persistState(ctx, state); err2 != nil {
-					return PipelineOutput{FinalState: state, StepCount: i}, err2
-				}
+					task.Status = "awaiting_approval"
+					task.Error = err.Error()
+					state.Status = "awaiting_approval"
+					if err2 := persistState(ctx, state); err2 != nil {
+						return PipelineOutput{FinalState: state, StepCount: i}, err2
+					}
 
-				// Block on the ApproveStep signal (re-use the existing HITL
-				// selector logic so operations are consistent).
-				var approval ApproveStepPayload
-				signalCh := workflow.GetSignalChannel(ctx, ApproveStepSignal)
+					var approval ApproveStepPayload
+					signalCh := workflow.GetSignalChannel(ctx, ApproveStepSignal)
+					selector := workflow.NewSelector(ctx)
+					timerFired := false
 
-				selector := workflow.NewSelector(ctx)
-				timerFired := false
+					selector.AddReceive(signalCh, func(ch workflow.ReceiveChannel, more bool) { ch.Receive(ctx, &approval) })
+					selector.AddFuture(workflow.NewTimer(ctx, HITLTimeout), func(f workflow.Future) { timerFired = true })
 
-				selector.AddReceive(signalCh, func(ch workflow.ReceiveChannel, more bool) {
-					ch.Receive(ctx, &approval)
-				})
-				selector.AddFuture(workflow.NewTimer(ctx, HITLTimeout), func(f workflow.Future) {
-					timerFired = true
-				})
+					selector.Select(ctx)
 
-				selector.Select(ctx)
+					if timerFired {
+						state.Status = "failed"
+						_ = persistState(ctx, state)
+						return PipelineOutput{FinalState: state, StepCount: i},
+							temporal.NewApplicationError("HITL timeout: no approval received", "HITLTimeout")
+					}
 
-				if timerFired {
+					if !approval.Approved {
+						state.Status = "failed"
+						_ = persistState(ctx, state)
+						return PipelineOutput{FinalState: state, StepCount: i},
+							temporal.NewApplicationError("HITL rejected by "+approval.Reviewer, "HITLRejected")
+					}
+
+					if approval.EditedState != nil {
+						state = approval.EditedState
+						logger.Info("HITL state edit applied (escalation)", "reviewer", approval.Reviewer)
+					}
+
+					task.Status = "completed"
+					state.Status = "running"
+					logger.Info("HITL approved (escalation)", "reviewer", approval.Reviewer, "comment", approval.Comment)
+
+				} else {
+					task.Status = "failed"
+					task.Error = err.Error()
 					state.Status = "failed"
 					_ = persistState(ctx, state)
-					return PipelineOutput{FinalState: state, StepCount: i},
-						temporal.NewApplicationError("HITL timeout: no approval received", "HITLTimeout")
+					return PipelineOutput{FinalState: state, StepCount: i}, err
 				}
-
-				if !approval.Approved {
-					state.Status = "failed"
-					_ = persistState(ctx, state)
-					return PipelineOutput{FinalState: state, StepCount: i},
-						temporal.NewApplicationError("HITL rejected by "+approval.Reviewer, "HITLRejected")
-				}
-
-				// Apply manual edits if provided.
-				if approval.EditedState != nil {
-					state = approval.EditedState
-					logger.Info("HITL state edit applied (escalation)", "reviewer", approval.Reviewer)
-				}
-
-				task.Status = "completed"
-				state.Status = "running"
-				logger.Info("HITL approved (escalation)", "reviewer", approval.Reviewer, "comment", approval.Comment)
-
 			} else {
-				task.Status = "failed"
-				task.Error = err.Error()
-				state.Status = "failed"
-				_ = persistState(ctx, state)
-				return PipelineOutput{FinalState: state, StepCount: i}, err
+				state = apiOut.UpdatedState
+				state.CurrentStep = i + 1
 			}
-		}
+		} else {
+			var agentOut RunAgentOutput
+			err = workflow.ExecuteActivity(actCtx, (*Activities).RunAgent, RunAgentInput{
+				State:     state,
+				AgentCard: card,
+				TaskIndex: i,
+			}).Get(actCtx, &agentOut)
+			if err != nil {
+				if task.OnHang == "escalate" {
+					logger.Info("escalating task to HITL due to activity error", "task", task.Name, "error", err)
 
-		// Merge the agent's updated state back into our local copy.
-		state = agentOut.UpdatedState
-		state.CurrentStep = i + 1
+					task.Status = "awaiting_approval"
+					task.Error = err.Error()
+					state.Status = "awaiting_approval"
+					if err2 := persistState(ctx, state); err2 != nil {
+						return PipelineOutput{FinalState: state, StepCount: i}, err2
+					}
+
+					var approval ApproveStepPayload
+					signalCh := workflow.GetSignalChannel(ctx, ApproveStepSignal)
+					selector := workflow.NewSelector(ctx)
+					timerFired := false
+
+					selector.AddReceive(signalCh, func(ch workflow.ReceiveChannel, more bool) { ch.Receive(ctx, &approval) })
+					selector.AddFuture(workflow.NewTimer(ctx, HITLTimeout), func(f workflow.Future) { timerFired = true })
+
+					selector.Select(ctx)
+
+					if timerFired {
+						state.Status = "failed"
+						_ = persistState(ctx, state)
+						return PipelineOutput{FinalState: state, StepCount: i},
+							temporal.NewApplicationError("HITL timeout: no approval received", "HITLTimeout")
+					}
+
+					if !approval.Approved {
+						state.Status = "failed"
+						_ = persistState(ctx, state)
+						return PipelineOutput{FinalState: state, StepCount: i},
+							temporal.NewApplicationError("HITL rejected by "+approval.Reviewer, "HITLRejected")
+					}
+
+					if approval.EditedState != nil {
+						state = approval.EditedState
+						logger.Info("HITL state edit applied (escalation)", "reviewer", approval.Reviewer)
+					}
+
+					task.Status = "completed"
+					state.Status = "running"
+					logger.Info("HITL approved (escalation)", "reviewer", approval.Reviewer, "comment", approval.Comment)
+
+				} else {
+					task.Status = "failed"
+					task.Error = err.Error()
+					state.Status = "failed"
+					_ = persistState(ctx, state)
+					return PipelineOutput{FinalState: state, StepCount: i}, err
+				}
+			}
+
+			// Merge the agent's updated state back into our local copy.
+			state = agentOut.UpdatedState
+			state.CurrentStep = i + 1
+		}
 
 		// ----------------------------------------------------------------
 		// HITL gate: pause if confidence < HITLThreshold

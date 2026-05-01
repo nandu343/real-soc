@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +66,16 @@ func main() {
 	}
 	zlog.SugaredWithTrace(context.Background()).Infow("docker runner ready", "network", networkName)
 
+	// HTTP runner for remote/api agents (optional). Timeout configurable.
+	httpTimeout := 30 // seconds
+	if v := getenv("HTTP_RUNNER_TIMEOUT", ""); v != "" {
+		// attempt to parse but ignore errors and fall back to default
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			httpTimeout = parsed
+		}
+	}
+	httpRunner := runner.NewHTTPRunner(time.Duration(httpTimeout) * time.Second)
+
 	// Optionally start a shared Proxy Agent service so that agents configured
 	// with Outbound=="proxy" may reach external services through this
 	// controlled gateway. Configure with PROXY_AGENT_IMAGE and
@@ -105,8 +116,9 @@ func main() {
 	zlog.SugaredWithTrace(context.Background()).Infow("temporal client connected", "addr", temporalAddress)
 
 	// Register activities and workflows with the worker.
+	multiRunner := &runner.MultiRunner{Docker: dockerRunner, HTTP: httpRunner}
 	acts := &workflow.Activities{
-		Runner: dockerRunner,
+		Runner: multiRunner,
 		Store:  store,
 	}
 

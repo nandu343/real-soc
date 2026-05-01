@@ -56,6 +56,14 @@ func (f *fakeStore) ListPausedForHuman() ([]models.WorkflowState, error) {
 	return []models.WorkflowState{}, nil
 }
 
+// Registry methods (test stubs)
+func (f *fakeStore) SaveAgent(a *models.AgentRecord) error               { return nil }
+func (f *fakeStore) GetAgentByID(id string) (*models.AgentRecord, error) { return nil, nil }
+func (f *fakeStore) ListRegisteredAgents() ([]models.AgentRecord, error) {
+	return []models.AgentRecord{}, nil
+}
+func (f *fakeStore) DeleteAgent(id string) error { return nil }
+
 // fakeTemporal implements the minimal TemporalClient used by the handlers.
 type fakeTemporal struct {
 	signalled bool
