@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #__next {
+  height: 100%;
+}
+
+pre {
+  background: #0f172a;
+  color: #e6eef8;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  overflow: auto;
+}

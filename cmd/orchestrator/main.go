@@ -112,6 +112,8 @@ func main() {
 
 	w := worker.New(temporalClient, workflow.TaskQueueName, worker.Options{})
 	w.RegisterWorkflow(workflow.AgentPipelineWorkflow)
+	// Register the Interpreter workflow so we can start graph-driven runs.
+	w.RegisterWorkflow(workflow.InterpreterWorkflow)
 	w.RegisterActivity(acts)
 
 	// Start the worker in a goroutine so it runs alongside the HTTP server.

@@ -20,6 +20,7 @@ import (
 	"github.com/nandu343/real-soc/internal/models"
 	"github.com/nandu343/real-soc/internal/workflow"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 )
 
 // Store defines the subset of persistence operations the HTTP handlers use.
@@ -29,12 +30,17 @@ type Store interface {
 	ListSnapshots(string) ([]models.WorkflowStateSnapshot, error)
 	GetSnapshotByID(string) (*models.WorkflowStateSnapshot, error)
 	SaveSnapshot(*models.WorkflowState, int, string) error
+	// ListAgentCards returns the set of known AgentCard entries (registry).
+	ListAgentCards() ([]models.AgentCard, error)
+	// ListPausedForHuman returns workflow states currently awaiting human input.
+	ListPausedForHuman() ([]models.WorkflowState, error)
 }
 
 // TemporalClient defines the subset of the Temporal client used by handlers.
 type TemporalClient interface {
 	ExecuteWorkflow(ctx context.Context, options client.StartWorkflowOptions, workflow interface{}, args ...interface{}) (client.WorkflowRun, error)
 	SignalWorkflow(ctx context.Context, workflowID, runID, signalName string, arg interface{}) error
+	QueryWorkflow(ctx context.Context, workflowID, runID, queryType string, args ...interface{}) (converter.EncodedValue, error)
 }
 
 // Handler groups all HTTP handler dependencies.
@@ -59,8 +65,21 @@ func (h *Handler) Register(app *fiber.App) {
 	v1.Post("/workflows", h.StartWorkflow)
 	v1.Get("/workflows/:id", h.GetWorkflow)
 	v1.Get("/workflows/:id/snapshots", h.ListSnapshots)
+	v1.Get("/agents", h.ListAgents)
+	v1.Get("/workflows/:id/query", h.QueryWorkflow)
+	v1.Get("/inbox", h.Inbox)
 	v1.Post("/workflows/:id/approve", h.ApproveStep)
 	v1.Post("/workflows/:id/restore", h.RestoreSnapshot)
+	v1.Post("/workflows/:id/human-input", h.HumanInput)
+}
+
+// ListAgents returns the distinct AgentCard registry discovered in the DB.
+func (h *Handler) ListAgents(c *fiber.Ctx) error {
+	cards, err := h.store.ListAgentCards()
+	if err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	return c.JSON(cards)
 }
 
 // --------------------------------------------------------------------------
@@ -139,7 +158,7 @@ func (h *Handler) StartWorkflow(c *fiber.Ctx) error {
 	run, err := h.temporalClient.ExecuteWorkflow(
 		c.Context(),
 		opts,
-		workflow.AgentPipelineWorkflow,
+		workflow.InterpreterWorkflow,
 		workflow.PipelineInput{InitialState: req.InitialState},
 	)
 	if err != nil {
@@ -280,4 +299,82 @@ func (h *Handler) ApproveStep(c *fiber.Ctx) error {
 		"reviewer":    req.Reviewer,
 		"approved":    req.Approved,
 	})
+}
+
+// QueryWorkflow executes a Temporal query against the live workflow and
+// returns the decoded query result. By default it uses the "getState"
+// query handler implemented by workflows.
+func (h *Handler) QueryWorkflow(c *fiber.Ctx) error {
+	workflowID := c.Params("id")
+	if workflowID == "" {
+		return fiber.NewError(http.StatusBadRequest, "workflow id is required")
+	}
+
+	runID := c.Query("run_id", "")
+	q := c.Query("q", "getState")
+
+	ev, err := h.temporalClient.QueryWorkflow(c.Context(), workflowID, runID, q)
+	if err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "query error: "+err.Error())
+	}
+
+	var state models.WorkflowState
+	if ev == nil {
+		return fiber.NewError(http.StatusInternalServerError, "empty query result")
+	}
+	if err := ev.Get(&state); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "failed to decode query result: "+err.Error())
+	}
+
+	return c.JSON(state)
+}
+
+// Inbox returns workflow states that are paused awaiting human analyst input.
+// This powers the operator "inbox" view where analysts pick up items to review.
+func (h *Handler) Inbox(c *fiber.Ctx) error {
+	states, err := h.store.ListPausedForHuman()
+	if err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	return c.JSON(states)
+}
+
+// HumanInput accepts a modified WorkflowState from a human analyst and
+// signals the corresponding Temporal workflow to resume execution.
+// The handler persists the human-edited state as a distinct snapshot so the
+// audit trail clearly shows analyst changes.
+func (h *Handler) HumanInput(c *fiber.Ctx) error {
+	workflowID := c.Params("id")
+	if workflowID == "" {
+		return fiber.NewError(http.StatusBadRequest, "workflow id is required")
+	}
+
+	var edited models.WorkflowState
+	if err := c.BodyParser(&edited); err != nil {
+		return fiber.NewError(http.StatusBadRequest, "invalid JSON body: "+err.Error())
+	}
+
+	// Basic validation: ensure we have a TraceID and WorkflowID
+	if edited.TraceID == "" {
+		return fiber.NewError(http.StatusBadRequest, "edited state must include trace_id")
+	}
+	if edited.WorkflowID == "" {
+		// allow the caller to omit workflow_id and infer from path
+		edited.WorkflowID = workflowID
+	}
+
+	// Persist the edited state and record a human_input snapshot.
+	if err := h.store.Save(&edited); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db save error: "+err.Error())
+	}
+	if err := h.store.SaveSnapshot(&edited, edited.CurrentStep, "human_input"); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db snapshot error: "+err.Error())
+	}
+
+	// Signal the Temporal workflow to deliver the human-modified state.
+	if err := h.temporalClient.SignalWorkflow(c.Context(), workflowID, "", "HumanInputSignal", edited); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "signal error: "+err.Error())
+	}
+
+	return c.JSON(fiber.Map{"status": "human_input_sent", "workflow_id": workflowID})
 }
