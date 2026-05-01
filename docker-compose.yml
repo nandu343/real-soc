@@ -1,12 +1,12 @@
 version: "3.9"
 
-# SOC-OS local development stack
+# Real-SOC local development stack
 # ────────────────────────────────────────────────────────────────────────────
 # Services:
 #   postgres   — audit database (stores WorkflowState history as JSONB)
 #   temporal   — workflow engine (replaces AWS Step Functions)
 #   temporal-ui — Temporal web UI for monitoring workflows
-#   orchestrator — the SOC-OS Go service (API + worker)
+#   orchestrator — the Real-SOC Go service (API + worker)
 # ────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -84,7 +84,7 @@ services:
       - "8088:8080"
 
   # --------------------------------------------------------------------------
-  # SOC-OS Orchestrator — Go service
+  # Real-SOC Orchestrator — Go service
   # --------------------------------------------------------------------------
   orchestrator:
     build:

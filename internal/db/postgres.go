@@ -1,4 +1,4 @@
-// Package db provides the PostgreSQL persistence layer for SOC-OS.
+// Package db provides the PostgreSQL persistence layer for Real-SOC.
 // It uses GORM with the pgx driver so every WorkflowState transition is
 // durably recorded as an append-only JSONB document for auditing.
 package db
@@ -47,10 +47,11 @@ func New(dsn string) (*Store, error) {
 		return nil, fmt.Errorf("db: open connection: %w", err)
 	}
 
-	// Auto-migrate creates / updates the workflow_states table.
+	// Auto-migrate creates / updates the workflow_states and snapshot tables.
 	// The JSONB columns (agent_cards, tasks, artifacts) are handled by the
-	// custom Scanner/Valuer types defined in models.
-	if err := db.AutoMigrate(&models.WorkflowState{}); err != nil {
+	// custom Scanner/Valuer types defined in models.  We also migrate the
+	// WorkflowStateSnapshot model used for time-machine snapshots.
+	if err := db.AutoMigrate(&models.WorkflowState{}, &models.WorkflowStateSnapshot{}); err != nil {
 		return nil, fmt.Errorf("db: auto-migrate: %w", err)
 	}
 
@@ -99,6 +100,44 @@ func (s *Store) Close() error {
 		return err
 	}
 	return sqlDB.Close()
+}
+
+// SaveSnapshot inserts an immutable snapshot of the given WorkflowState.
+// Snapshots are append-only and indexed by workflow_id so callers can
+// reconstruct the full timeline of a run.
+func (s *Store) SaveSnapshot(state *models.WorkflowState, step int, snapType string) error {
+	snap, err := models.NewSnapshotFromState(state, step, snapType)
+	if err != nil {
+		return fmt.Errorf("db: new snapshot: %w", err)
+	}
+	result := s.db.Create(snap)
+	if result.Error != nil {
+		return fmt.Errorf("db: save snapshot %s: %w", state.TraceID, result.Error)
+	}
+	return nil
+}
+
+// ListSnapshots returns all snapshots for a workflow ordered by newest first.
+func (s *Store) ListSnapshots(workflowID string) ([]models.WorkflowStateSnapshot, error) {
+	var snaps []models.WorkflowStateSnapshot
+	result := s.db.
+		Where("workflow_id = ?", workflowID).
+		Order("created_at DESC").
+		Find(&snaps)
+	if result.Error != nil {
+		return nil, fmt.Errorf("db: list snapshots for workflow %s: %w", workflowID, result.Error)
+	}
+	return snaps, nil
+}
+
+// GetSnapshotByID retrieves a single snapshot by its ID.
+func (s *Store) GetSnapshotByID(id string) (*models.WorkflowStateSnapshot, error) {
+	var snap models.WorkflowStateSnapshot
+	result := s.db.First(&snap, "id = ?", id)
+	if result.Error != nil {
+		return nil, fmt.Errorf("db: get snapshot %s: %w", id, result.Error)
+	}
+	return &snap, nil
 }
 
 // getenv returns the value of the named environment variable, or fallback if

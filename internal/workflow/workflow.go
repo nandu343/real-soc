@@ -1,16 +1,16 @@
-// Package workflow contains the Temporal Workflow definition for the SOC-OS
+// Package workflow contains the Temporal Workflow definition for the Real-SOC
 // agentic pipeline.
 //
 // Workflow overview
 // ─────────────────
 // The AgentPipelineWorkflow orchestrates a sequence of agent containers.
 // Each step:
-//   1. Executes the agent via the RunAgent activity.
-//   2. Inspects the confidence score of the completed task.
-//   3. If confidence < HITLThreshold (0.7), pauses and waits for a human
-//      operator to send an ApproveStep signal with an optional JSON edit to
-//      the state.  This is the "Human-in-the-Loop" (HITL) gate.
-//   4. Advances to the next agent in the pipeline.
+//  1. Executes the agent via the RunAgent activity.
+//  2. Inspects the confidence score of the completed task.
+//  3. If confidence < HITLThreshold (0.7), pauses and waits for a human
+//     operator to send an ApproveStep signal with an optional JSON edit to
+//     the state.  This is the "Human-in-the-Loop" (HITL) gate.
+//  4. Advances to the next agent in the pipeline.
 //
 // Temporal guarantees that all state is durably checkpointed between steps,
 // so the workflow survives worker restarts without losing progress.
@@ -20,13 +20,14 @@ import (
 	"time"
 
 	"github.com/nandu343/real-soc/internal/models"
+	templog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
 
 const (
 	// TaskQueueName is the Temporal task queue that the worker listens on.
-	TaskQueueName = "soc-os-task-queue"
+	TaskQueueName = "real-soc-task-queue"
 
 	// HITLThreshold is the minimum confidence score required to skip the
 	// Human-in-the-Loop approval gate.  Tasks with a lower score pause
@@ -93,8 +94,16 @@ type PipelineOutput struct {
 // The function signature matches the Temporal SDK's workflow registration
 // requirement: (workflow.Context, <input>) (<output>, error).
 func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineOutput, error) {
-	logger := workflow.GetLogger(ctx)
+	// Attach a workflow-scoped logger and include the TraceID so every
+	// workflow log line contains the trace identifier.
 	state := input.InitialState
+	baseLogger := workflow.GetLogger(ctx)
+	var logger templog.Logger
+	if wl, ok := baseLogger.(templog.WithLogger); ok {
+		logger = wl.With("trace_id", state.TraceID)
+	} else {
+		logger = baseLogger
+	}
 
 	// Register a query handler so external callers can inspect the live state
 	// without interrupting the workflow.
@@ -103,6 +112,22 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 	}); err != nil {
 		return PipelineOutput{}, err
 	}
+
+	// Listen for RestoreState signals so external actors can replace the
+	// in-flight WorkflowState.  We spawn a non-blocking goroutine that
+	// receives any RestoreState payloads and persists them.
+	restoreCh := workflow.GetSignalChannel(ctx, "RestoreState")
+	workflow.Go(ctx, func(ctx workflow.Context) {
+		for {
+			var restored models.WorkflowState
+			restoreCh.Receive(ctx, &restored)
+			logger.Info("RestoreState signal received", "trace_id", restored.TraceID)
+			state = &restored
+			if err := persistState(ctx, state); err != nil {
+				logger.Error("failed to persist restored state", "error", err)
+			}
+		}
+	})
 
 	// Persist the initial state via the PersistState activity.
 	state.Status = "running"
@@ -127,6 +152,13 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 		}
 
 		// Execute the agent container via the RunAgent activity.
+		// Allow per-task control of how hangs are handled via `TaskObject.OnHang`.
+		// If OnHang == "escalate" we set MaximumAttempts=1 so the workflow
+		// immediately receives the failure and can escalate to a human.
+		maxAttempts := int32(3)
+		if task.OnHang == "escalate" {
+			maxAttempts = 1
+		}
 		activityOptions := workflow.ActivityOptions{
 			StartToCloseTimeout: 10 * time.Minute,
 			HeartbeatTimeout:    30 * time.Second,
@@ -134,7 +166,7 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 				InitialInterval:    5 * time.Second,
 				BackoffCoefficient: 2.0,
 				MaximumInterval:    60 * time.Second,
-				MaximumAttempts:    3,
+				MaximumAttempts:    maxAttempts,
 			},
 		}
 		actCtx := workflow.WithActivityOptions(ctx, activityOptions)
@@ -146,11 +178,66 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 			TaskIndex: i,
 		}).Get(actCtx, &agentOut)
 		if err != nil {
-			task.Status = "failed"
-			task.Error = err.Error()
-			state.Status = "failed"
-			_ = persistState(ctx, state)
-			return PipelineOutput{FinalState: state, StepCount: i}, err
+			// If the task is configured to escalate on hang/failure, move to
+			// the Human-in-the-Loop approval flow instead of failing the run.
+			if task.OnHang == "escalate" {
+				logger.Info("escalating task to HITL due to activity error", "task", task.Name, "error", err)
+
+				task.Status = "awaiting_approval"
+				task.Error = err.Error()
+				state.Status = "awaiting_approval"
+				if err2 := persistState(ctx, state); err2 != nil {
+					return PipelineOutput{FinalState: state, StepCount: i}, err2
+				}
+
+				// Block on the ApproveStep signal (re-use the existing HITL
+				// selector logic so operations are consistent).
+				var approval ApproveStepPayload
+				signalCh := workflow.GetSignalChannel(ctx, ApproveStepSignal)
+
+				selector := workflow.NewSelector(ctx)
+				timerFired := false
+
+				selector.AddReceive(signalCh, func(ch workflow.ReceiveChannel, more bool) {
+					ch.Receive(ctx, &approval)
+				})
+				selector.AddFuture(workflow.NewTimer(ctx, HITLTimeout), func(f workflow.Future) {
+					timerFired = true
+				})
+
+				selector.Select(ctx)
+
+				if timerFired {
+					state.Status = "failed"
+					_ = persistState(ctx, state)
+					return PipelineOutput{FinalState: state, StepCount: i},
+						temporal.NewApplicationError("HITL timeout: no approval received", "HITLTimeout")
+				}
+
+				if !approval.Approved {
+					state.Status = "failed"
+					_ = persistState(ctx, state)
+					return PipelineOutput{FinalState: state, StepCount: i},
+						temporal.NewApplicationError("HITL rejected by "+approval.Reviewer, "HITLRejected")
+				}
+
+				// Apply manual edits if provided.
+				if approval.EditedState != nil {
+					state = approval.EditedState
+					logger.Info("HITL state edit applied (escalation)", "reviewer", approval.Reviewer)
+				}
+
+				task.Status = "completed"
+				state.Status = "running"
+				logger.Info("HITL approved (escalation)", "reviewer", approval.Reviewer, "comment", approval.Comment)
+
+			} else {
+				task.Status = "failed"
+				task.Error = err.Error()
+				state.Status = "failed"
+				_ = persistState(ctx, state)
+				return PipelineOutput{FinalState: state, StepCount: i}, err
+			}
 		}
 
 		// Merge the agent's updated state back into our local copy.
