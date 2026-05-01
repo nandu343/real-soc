@@ -143,11 +143,23 @@ type AgentRunOutput struct {
 //  7. Cleans up all temporary resources.
 func (r *DockerRunner) RunAgent(ctx context.Context, input AgentRunInput) (AgentRunOutput, error) {
 	// ------------------------------------------------------------------
-	// 1. Serialise current state to an in-memory tar archive which will be
-	//    copied into a size-limited tmpfs inside the container.  Using a
-	//    tmpfs prevents container writes from consuming host disk space.
+	// 1. Prepare and serialise the (pruned) state that will be copied into
+	//    the agent container.  If a specialised summarizer image is
+	//    configured via `SUMMARIZER_AGENT_IMAGE` we attempt a summarization
+	//    pass first; otherwise we fall back to an in-process pruning pass.
 	// ------------------------------------------------------------------
-	stateBytes, err := json.Marshal(input.State)
+	stateForAgent := input.State
+	if img := os.Getenv("SUMMARIZER_AGENT_IMAGE"); img != "" && len(input.State.Tasks) > DefaultMaxExpandedTasks {
+		if updated, serr := r.runSummarizerContainer(ctx, img, input.State); serr == nil && updated != nil {
+			stateForAgent = updated
+		} else {
+			// Best-effort: log and continue with local pruning on error.
+			fmt.Printf("runner: summarizer container failed: %v; falling back to local prune\n", serr)
+		}
+	}
+
+	pruned := PruneWorkflowStateForAgent(stateForAgent)
+	stateBytes, err := json.Marshal(pruned)
 	if err != nil {
 		return AgentRunOutput{}, fmt.Errorf("runner: marshal state: %w", err)
 	}
