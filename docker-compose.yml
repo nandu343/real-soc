@@ -1,0 +1,125 @@
+version: "3.9"
+
+# SOC-OS local development stack
+# ────────────────────────────────────────────────────────────────────────────
+# Services:
+#   postgres   — audit database (stores WorkflowState history as JSONB)
+#   temporal   — workflow engine (replaces AWS Step Functions)
+#   temporal-ui — Temporal web UI for monitoring workflows
+#   orchestrator — the SOC-OS Go service (API + worker)
+# ────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL — audit store
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: socuser
+      POSTGRES_PASSWORD: socpass
+      POSTGRES_DB: socdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U socuser -d socdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # Temporal — workflow engine
+  # Temporal requires its own Postgres database (separate from the SOC DB).
+  # --------------------------------------------------------------------------
+  temporal-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.26
+    restart: unless-stopped
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    ports:
+      - "7233:7233"
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  temporal-ui:
+    image: temporalio/ui:2.36.2
+    restart: unless-stopped
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8088:8080"
+
+  # --------------------------------------------------------------------------
+  # SOC-OS Orchestrator — Go service
+  # --------------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: socuser
+      POSTGRES_PASSWORD: socpass
+      POSTGRES_DB: socdb
+      TEMPORAL_ADDRESS: temporal:7233
+      DOCKER_AGENT_NETWORK: soc-agent-net
+      # Set REGISTRY_TOKEN if your agent images are in a private registry.
+      # REGISTRY_TOKEN: ""
+    ports:
+      - "8080:8080"   # REST API + MCP endpoint
+    volumes:
+      # Mount the Docker socket so the orchestrator can start agent containers.
+      # Security note: this grants significant host access.  In production,
+      # replace with a Docker-over-TLS or rootless Podman socket.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  temporal_postgres_data:
