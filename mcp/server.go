@@ -31,6 +31,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	memdump "github.com/nandu343/real-soc/internal/tools/memdump"
+	qtool "github.com/nandu343/real-soc/internal/tools/query"
 	yaraengine "github.com/nandu343/real-soc/internal/tools/yara"
 )
 
@@ -138,12 +139,14 @@ type rpcError struct {
 // MCPServer exposes the ToolRegistry over HTTP using the MCP JSON-RPC 2.0
 // protocol.  It is mounted on the main Fiber application under /mcp.
 type MCPServer struct {
-	registry *ToolRegistry
+	registry       *ToolRegistry
+	manifestMu     sync.RWMutex
+	manifestExtras map[string]any
 }
 
 // NewMCPServer creates an MCPServer backed by the given ToolRegistry.
 func NewMCPServer(registry *ToolRegistry) *MCPServer {
-	return &MCPServer{registry: registry}
+	return &MCPServer{registry: registry, manifestExtras: make(map[string]any)}
 }
 
 // Mount registers the MCP routes on the provided Fiber router.
@@ -155,6 +158,46 @@ func NewMCPServer(registry *ToolRegistry) *MCPServer {
 func (s *MCPServer) Mount(router fiber.Router) {
 	router.Post("/mcp/rpc", s.handleRPC)
 	router.Get("/mcp/tools", s.handleListTools)
+	router.Get("/mcp/manifest", s.handleManifest)
+}
+
+// SetManifestExtras sets additional top-level fields to include in the
+// manifest returned by /mcp/manifest.  Useful for communicating runtime
+// information (proxy availability, endpoints) to agents at startup.
+func (s *MCPServer) SetManifestExtras(extras map[string]any) {
+	s.manifestMu.Lock()
+	defer s.manifestMu.Unlock()
+	s.manifestExtras = extras
+}
+
+// handleManifest returns a JSON object containing the list of available
+// tools plus any configured manifest extras.  Agents should call this
+// endpoint to discover host-provided capabilities and runtime hints.
+func (s *MCPServer) handleManifest(c *fiber.Ctx) error {
+	tools := s.registry.List()
+	type toolDescriptor struct {
+		Name        string      `json:"name"`
+		Description string      `json:"description"`
+		Params      []ToolParam `json:"params"`
+	}
+	result := make([]toolDescriptor, 0, len(tools))
+	for _, t := range tools {
+		result = append(result, toolDescriptor{
+			Name:        t.Name,
+			Description: t.Description,
+			Params:      t.Params,
+		})
+	}
+
+	manifest := map[string]any{"tools": result}
+
+	s.manifestMu.RLock()
+	for k, v := range s.manifestExtras {
+		manifest[k] = v
+	}
+	s.manifestMu.RUnlock()
+
+	return c.JSON(manifest)
 }
 
 // handleRPC dispatches a JSON-RPC 2.0 request to the appropriate method.
@@ -340,6 +383,21 @@ func RegisterBuiltinTools(r *ToolRegistry) {
 				"strings": strs,
 				"status":  "ok",
 			}, nil
+		},
+	})
+
+	r.Register(&Tool{
+		Name:        "query",
+		Description: "Query local Elasticsearch or Splunk instances.",
+		Params: []ToolParam{
+			{Name: "backend", Type: "string", Description: "elasticsearch|splunk (optional)", Required: false},
+			{Name: "query", Type: "string", Description: "Query string", Required: true},
+			{Name: "index", Type: "string", Description: "Elasticsearch index (required for ES)", Required: false},
+			{Name: "size", Type: "number", Description: "Max results (ES)", Required: false},
+			{Name: "count", Type: "number", Description: "Max results (Splunk)", Required: false},
+		},
+		Handler: func(ctx context.Context, params map[string]any) (any, error) {
+			return qtool.RunQuery(ctx, params)
 		},
 	})
 

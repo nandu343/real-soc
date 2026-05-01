@@ -123,3 +123,33 @@ services:
 volumes:
   postgres_data:
   temporal_postgres_data:
+
+# Optional: Local LLM sidecars for development.
+# Uncomment one of the following service blocks to run a local model alongside the stack.
+# After enabling, set `LLM_BACKEND` and relevant URL/env in the `orchestrator` environment or
+# in your agent container runtime environment so the agent can reach the sidecar by service name.
+# Example: `LLM_BACKEND=ollama OLLAMA_URL=http://ollama:11434`
+#
+# ollama:
+#   image: ghcr.io/ollama/ollama:latest
+#   restart: unless-stopped
+#   # Expose the HTTP API on 11434 so agents can call http://ollama:11434
+#   ports:
+#     - "11434:11434"
+#   # Persist model data (adjust path as needed)
+#   # volumes:
+#   #   - ./ollama/models:/var/lib/ollama/models
+#   # Notes: Ollama may stream responses by default. The agent uses ?stream=false
+#   # when making requests. Adjust `OLLAMA_URL` and `LLM_MODEL` as needed.
+#
+# vllm:
+#   image: vllm/vllm:latest
+#   restart: unless-stopped
+#   ports:
+#     - "8000:8000"
+#   # If your vLLM server requires specific model mounts/config, mount them here.
+#   # volumes:
+#   #   - ./vllm/models:/models
+#   # Notes: vLLM HTTP endpoints vary by deployment; the agent will try common
+#   # endpoints such as /v1/generate, /generate, /v1/completions.
+

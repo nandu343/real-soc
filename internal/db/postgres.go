@@ -130,6 +130,49 @@ func (s *Store) ListSnapshots(workflowID string) ([]models.WorkflowStateSnapshot
 	return snaps, nil
 }
 
+// ListAgentCards aggregates distinct AgentCard entries present in stored
+// WorkflowState records. This is a lightweight registry view suitable for
+// a dashboard or palette UI.
+func (s *Store) ListAgentCards() ([]models.AgentCard, error) {
+	var states []models.WorkflowState
+	result := s.db.Find(&states)
+	if result.Error != nil {
+		return nil, fmt.Errorf("db: list states for agents: %w", result.Error)
+	}
+
+	unique := make(map[string]models.AgentCard)
+	for _, st := range states {
+		for _, c := range st.AgentCards {
+			if c.AgentID == "" {
+				continue
+			}
+			if _, ok := unique[c.AgentID]; !ok {
+				unique[c.AgentID] = c
+			}
+		}
+	}
+
+	out := make([]models.AgentCard, 0, len(unique))
+	for _, v := range unique {
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// ListPausedForHuman returns all workflow states currently paused and
+// awaiting human input. This backs the UI Inbox view.
+func (s *Store) ListPausedForHuman() ([]models.WorkflowState, error) {
+	var states []models.WorkflowState
+	result := s.db.
+		Where("status = ?", "paused_for_human").
+		Order("updated_at DESC").
+		Find(&states)
+	if result.Error != nil {
+		return nil, fmt.Errorf("db: list paused_for_human: %w", result.Error)
+	}
+	return states, nil
+}
+
 // GetSnapshotByID retrieves a single snapshot by its ID.
 func (s *Store) GetSnapshotByID(id string) (*models.WorkflowStateSnapshot, error) {
 	var snap models.WorkflowStateSnapshot

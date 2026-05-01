@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -142,11 +143,23 @@ type AgentRunOutput struct {
 //  7. Cleans up all temporary resources.
 func (r *DockerRunner) RunAgent(ctx context.Context, input AgentRunInput) (AgentRunOutput, error) {
 	// ------------------------------------------------------------------
-	// 1. Serialise current state to an in-memory tar archive which will be
-	//    copied into a size-limited tmpfs inside the container.  Using a
-	//    tmpfs prevents container writes from consuming host disk space.
+	// 1. Prepare and serialise the (pruned) state that will be copied into
+	//    the agent container.  If a specialised summarizer image is
+	//    configured via `SUMMARIZER_AGENT_IMAGE` we attempt a summarization
+	//    pass first; otherwise we fall back to an in-process pruning pass.
 	// ------------------------------------------------------------------
-	stateBytes, err := json.Marshal(input.State)
+	stateForAgent := input.State
+	if img := os.Getenv("SUMMARIZER_AGENT_IMAGE"); img != "" && len(input.State.Tasks) > DefaultMaxExpandedTasks {
+		if updated, serr := r.runSummarizerContainer(ctx, img, input.State); serr == nil && updated != nil {
+			stateForAgent = updated
+		} else {
+			// Best-effort: log and continue with local pruning on error.
+			fmt.Printf("runner: summarizer container failed: %v; falling back to local prune\n", serr)
+		}
+	}
+
+	pruned := PruneWorkflowStateForAgent(stateForAgent)
+	stateBytes, err := json.Marshal(pruned)
 	if err != nil {
 		return AgentRunOutput{}, fmt.Errorf("runner: marshal state: %w", err)
 	}
@@ -174,6 +187,23 @@ func (r *DockerRunner) RunAgent(ctx context.Context, input AgentRunInput) (Agent
 	// Copy the initial state.json into the container workspace before start.
 	if err := r.copyToContainer(ctx, containerID, stateFileName, stateBytes); err != nil {
 		return AgentRunOutput{}, fmt.Errorf("runner: copy initial state into container: %w", err)
+	}
+
+	// Fetch the MCP Tool Manifest and provide it to the agent as
+	// /workspace/tool_manifest.json so the agent knows what host tools exist.
+	manifestBytes, err := r.fetchToolManifest(ctx)
+	if err != nil {
+		// Don't fail the run for a manifest fetch error; provide a small
+		// fallback manifest so agents can still start and operate.
+		fallback := map[string]any{"error": "failed_fetch_manifest", "detail": err.Error()}
+		if b, jerr := json.Marshal(fallback); jerr == nil {
+			manifestBytes = b
+		} else {
+			manifestBytes = []byte(`{"error":"failed_generate_manifest"}`)
+		}
+	}
+	if err := r.copyToContainer(ctx, containerID, "tool_manifest.json", manifestBytes); err != nil {
+		return AgentRunOutput{}, fmt.Errorf("runner: copy manifest into container: %w", err)
 	}
 
 	// ------------------------------------------------------------------
@@ -428,6 +458,68 @@ func (r *DockerRunner) copyToContainer(ctx context.Context, containerID, fileNam
 	}
 
 	return r.cli.CopyToContainer(ctx, containerID, workspaceDir, &buf, container.CopyToContainerOptions{AllowOverwriteDirWithFile: true})
+}
+
+// fetchToolManifest retrieves the MCP `tools` manifest from the local
+// orchestrator HTTP server so we can provide it to agents at startup. The
+// URL may be overridden with `MCP_URL`. If empty, we default to
+// http://localhost:${MCP_PORT|PORT|8080}/mcp/tools.
+func (r *DockerRunner) fetchToolManifest(ctx context.Context) ([]byte, error) {
+	// Determine a base host root for MCP endpoints.
+	mcpURL := os.Getenv("MCP_URL")
+	var base string
+	if mcpURL != "" {
+		base = strings.TrimRight(mcpURL, "/")
+		// If a path like /mcp/tools or /mcp/manifest was provided, strip it
+		// to get the base host:port. Split on "/mcp" and take the first
+		// part (the host root).
+		if parts := strings.SplitN(base, "/mcp", 2); len(parts) > 0 {
+			base = parts[0]
+		}
+	} else {
+		port := os.Getenv("MCP_PORT")
+		if port == "" {
+			port = os.Getenv("PORT")
+			if port == "" {
+				port = "8080"
+			}
+		}
+		base = fmt.Sprintf("http://localhost:%s", port)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Prefer /mcp/manifest which includes runtime extras; fall back to /mcp/tools.
+	tryURLs := []string{base + "/mcp/manifest", base + "/mcp/tools"}
+	var lastErr error
+	for _, u := range tryURLs {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			b, _ := io.ReadAll(resp.Body)
+			lastErr = fmt.Errorf("mcp manifest fetch failed (%s): %s", u, string(b))
+			continue
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return data, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("failed to fetch MCP manifest from %v", tryURLs)
 }
 
 // ensureNetwork creates the isolated Docker bridge network for agent

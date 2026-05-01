@@ -242,6 +242,25 @@ GET http://172.17.0.1:8081/mcp/tools
 The host gateway IP (`172.17.0.1`) is the default Docker bridge address.
 Set `MCP_PORT` (default `8081`) if you change the port.
 
+### Tool Manifest (agent discovery)
+
+Agents also receive a runtime `tool_manifest` written to `/workspace/tool_manifest.json` by the runner at container start. This file contains the same tool descriptions returned by the MCP host plus runtime hints such as whether a Proxy Agent is available and its URL. Agents MUST read this file at startup to know what host capabilities they may call.
+
+Example `/workspace/tool_manifest.json`:
+
+```json
+{
+  "tools": [
+    {"name":"yara_scan","description":"Scan a file or memory buffer","params":[{"name":"target_path","type":"string"}]}
+  ],
+  "proxy_enabled": true,
+  "proxy_url": "http://proxy-agent:8080/forward",
+  "proxy_allowed_hosts": ["virustotal.com"]
+}
+```
+
+Agents should prefer `proxy_url` when their `AgentCard.Outbound` is `proxy`, and fall back to the MCP RPC endpoints for tool invocation.
+
 ---
 
 ## Security Sandboxing
@@ -343,6 +362,32 @@ implementations in `mcp/server.go` with real integrations.
 | `yara_scan` | Scan a file against YARA rules |
 | `file_hash` | Compute SHA-256 and MD5 hashes |
 | `sandbox_detonate` | Submit to a malware sandbox (Cuckoo, ANY.RUN, …) |
+| `query` | Query Elasticsearch or Splunk instances (local) |
+
+### Query Tool (Elasticsearch / Splunk)
+
+The `query` MCP tool provides a lightweight bridge to local Elasticsearch or Splunk instances. It autodetects the backend from environment variables or accepts an explicit `backend` parameter.
+
+Environment variables (optional):
+
+- `ES_URL` — Elasticsearch base URL (e.g. `http://es.local:9200`).
+- `ES_USERNAME` / `ES_PASSWORD` — Basic auth credentials for ES.
+- `SPLUNK_URL` — Splunk management URL (e.g. `https://splunk.local:8089`).
+- `SPLUNK_TOKEN` — Bearer token for Splunk API access.
+
+Example (Elasticsearch):
+
+```json
+{ "name": "query", "params": { "backend": "elasticsearch", "index": "alerts", "query": "host:host1", "size": 50 } }
+```
+
+Example (Splunk):
+
+```json
+{ "name": "query", "params": { "backend": "splunk", "query": "index=main error", "count": 100 } }
+```
+
+Note: For deployments where ES/Splunk are on different hosts or require auth, set the corresponding env vars in the orchestrator container or pass `es_url`/`splunk_url` and auth params in the tool call.
 
 ---
 

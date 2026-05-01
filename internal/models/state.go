@@ -23,6 +23,10 @@ type AgentCard struct {
 	AgentID string `json:"agent_id"`
 	// Image is the fully-qualified container image reference (registry/name:tag).
 	Image string `json:"image"`
+	// Type indicates how the agent is executed. Supported values:
+	//   - "docker": run as a container via the DockerRunner
+	//   - "human": pause the workflow and wait for a human analyst
+	Type string `json:"type,omitempty"`
 	// Capabilities lists the high-level skills this agent provides.
 	Capabilities []string `json:"capabilities"`
 	// MCPTools lists the MCP tool names this agent exposes to the host.
@@ -62,6 +66,12 @@ type TaskObject struct {
 	Confidence float64 `json:"confidence"`
 	// Error contains a human-readable error message when Status == "failed".
 	Error string `json:"error,omitempty"`
+	// Next is the task_id of the next node in a graph-based workflow.
+	Next string `json:"next,omitempty"`
+	// ManualMetadata contains human-entered notes or overrides when a
+	// Task is executed by a human analyst. This is stored in the state
+	// so the audit trail shows what the analyst changed.
+	ManualMetadata map[string]any `json:"manual_metadata,omitempty"`
 }
 
 // Artifact represents an immutable file or data blob produced by an agent as

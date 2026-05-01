@@ -12,6 +12,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/nandu343/real-soc/internal/models"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 )
 
 // fakeStore implements the Store interface for tests.
@@ -45,6 +46,16 @@ func (f *fakeStore) SaveSnapshot(state *models.WorkflowState, step int, snapType
 	return nil
 }
 
+func (f *fakeStore) ListAgentCards() ([]models.AgentCard, error) {
+	// test stub: return empty registry
+	return []models.AgentCard{}, nil
+}
+
+func (f *fakeStore) ListPausedForHuman() ([]models.WorkflowState, error) {
+	// For tests return empty inbox
+	return []models.WorkflowState{}, nil
+}
+
 // fakeTemporal implements the minimal TemporalClient used by the handlers.
 type fakeTemporal struct {
 	signalled bool
@@ -62,6 +73,11 @@ func (f *fakeTemporal) SignalWorkflow(ctx context.Context, workflowID, runID, si
 	f.lastName = signalName
 	f.lastArg = arg
 	return nil
+}
+
+func (f *fakeTemporal) QueryWorkflow(ctx context.Context, workflowID, runID, queryType string, args ...interface{}) (converter.EncodedValue, error) {
+	// Tests that rely on queries can expand this stub. For now return nil.
+	return nil, nil
 }
 
 // (no additional stubs needed)
