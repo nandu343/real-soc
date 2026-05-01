@@ -1,4 +1,4 @@
-// Package models defines the core data structures used across the SOC-OS pipeline.
+// Package models defines the core data structures used across the Real-SOC pipeline.
 // The WorkflowState struct is the central "source of truth" passed between every
 // agent, conforming to the Agent2Agent (A2A) Protocol so any agent implementation
 // (Python, Go, Rust …) can consume and produce it via a standardised JSON shape.
@@ -45,6 +45,12 @@ type TaskObject struct {
 	Output map[string]any `json:"output,omitempty"`
 	// Status is one of: pending | running | completed | failed | awaiting_approval.
 	Status string `json:"status"`
+	// OnHang determines how the orchestrator should respond when the task
+	// appears to hang (heartbeat timeout or similar). Supported values:
+	//   - "retry" (default): allow Temporal activity retries
+	//   - "escalate": immediately escalate to a human (HITL) for approval
+	// Set by the initial workflow input per-task.
+	OnHang string `json:"on_hang,omitempty"`
 	// Confidence is a normalised score [0.0, 1.0] indicating the agent's
 	// certainty in its output. Values < 0.7 trigger a HITL pause.
 	Confidence float64 `json:"confidence"`

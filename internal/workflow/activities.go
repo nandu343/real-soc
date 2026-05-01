@@ -1,4 +1,4 @@
-// Package workflow contains the Temporal Activities used by the SOC-OS pipeline.
+// Package workflow contains the Temporal Activities used by the Real-SOC pipeline.
 //
 // An Activity is an ordinary Go function that performs a single, retryable unit
 // of work.  Activities are registered with a Temporal Worker and scheduled by
@@ -15,6 +15,7 @@ import (
 	"github.com/nandu343/real-soc/internal/models"
 	"github.com/nandu343/real-soc/internal/runner"
 	"go.temporal.io/sdk/activity"
+	templog "go.temporal.io/sdk/log"
 )
 
 // Activities bundles all dependencies needed by the activity functions.
@@ -48,7 +49,13 @@ type RunAgentOutput struct {
 // This function is registered as a Temporal Activity; Temporal will call it
 // inside a worker goroutine and handle retries on transient failures.
 func (a *Activities) RunAgent(ctx context.Context, input RunAgentInput) (RunAgentOutput, error) {
-	logger := activity.GetLogger(ctx)
+	baseLogger := activity.GetLogger(ctx)
+	var logger templog.Logger
+	if wl, ok := baseLogger.(templog.WithLogger); ok {
+		logger = wl.With("trace_id", input.State.TraceID)
+	} else {
+		logger = baseLogger
+	}
 	logger.Info("RunAgent started",
 		"agent", input.AgentCard.AgentID,
 		"image", input.AgentCard.Image,
@@ -57,6 +64,12 @@ func (a *Activities) RunAgent(ctx context.Context, input RunAgentInput) (RunAgen
 
 	// Heartbeat so Temporal knows the activity is still alive during a long pull.
 	activity.RecordHeartbeat(ctx, "pulling image")
+
+	// Persist a "before" snapshot so we can reconstruct the state prior
+	// to agent execution (time-machine capability).
+	if err := a.Store.SaveSnapshot(input.State, input.TaskIndex, "before"); err != nil {
+		return RunAgentOutput{}, fmt.Errorf("activity RunAgent: save snapshot (before): %w", err)
+	}
 
 	out, err := a.Runner.RunAgent(ctx, runner.AgentRunInput{
 		State:     input.State,
@@ -75,6 +88,13 @@ func (a *Activities) RunAgent(ctx context.Context, input RunAgentInput) (RunAgen
 
 	if err := a.Store.Save(out.UpdatedState); err != nil {
 		return RunAgentOutput{}, fmt.Errorf("activity RunAgent: persist state: %w", err)
+	}
+
+	// Persist an "after" snapshot capturing the exact state produced by the
+	// agent.  This is independent of the primary workflow_states row and
+	// creates the append-only timeline used for auditing / time travel.
+	if err := a.Store.SaveSnapshot(out.UpdatedState, input.TaskIndex, "after"); err != nil {
+		return RunAgentOutput{}, fmt.Errorf("activity RunAgent: save snapshot (after): %w", err)
 	}
 
 	logger.Info("RunAgent completed",
@@ -101,6 +121,11 @@ func (a *Activities) PersistState(ctx context.Context, state *models.WorkflowSta
 	if err := a.Store.Save(state); err != nil {
 		return fmt.Errorf("activity PersistState: %w", err)
 	}
-	activity.GetLogger(ctx).Info("state persisted", "trace_id", state.TraceID, "status", state.Status)
+	base := activity.GetLogger(ctx)
+	if wl, ok := base.(templog.WithLogger); ok {
+		wl.With("trace_id", state.TraceID).Info("state persisted", "status", state.Status)
+	} else {
+		base.Info("state persisted", "trace_id", state.TraceID, "status", state.Status)
+	}
 	return nil
 }

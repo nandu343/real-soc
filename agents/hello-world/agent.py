@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Hello-World SOC-OS Agent
+Hello-World Real-SOC Agent
 ========================
 This is the reference implementation of the Agent Hand-off Contract.
 
-Every SOC-OS agent MUST:
+Every Real-SOC agent MUST:
 1. Read the WorkflowState JSON from the path in $STATE_FILE.
 2. Locate its own TaskObject (matched by agent_id in the AgentCards list).
 3. Perform its work.
@@ -60,7 +60,7 @@ def main() -> int:
     task_input = task.get("input", {})
     counter = task_input.get("counter", 0) + 1
 
-    print(f"[INFO] Hello from SOC-OS hello-world agent! counter={counter}")
+    print(f"[INFO] Hello from Real-SOC hello-world agent! counter={counter}")
 
     # ── 4. Update the task with results ──────────────────────────────────────
     task["output"] = {
