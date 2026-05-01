@@ -387,11 +387,11 @@ func (r *DockerRunner) ensureNetwork(ctx context.Context) error {
 }
 
 // newUUID returns a random UUID string (version 4).
-// We inline a simple implementation here to avoid importing a large package.
+// We inline a minimal implementation here so the runner package does not
+// depend on an external UUID library.  The bytes are read from /dev/urandom
+// via readRandom, which uses os.Open — fully available in this package.
 func newUUID() string {
 	b := make([]byte, 16)
-	// crypto/rand is preferred but os.Getenv is unavailable here; use a
-	// deterministic fallback seeded by timestamp for low-collision IDs.
 	_ = readRandom(b)
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80

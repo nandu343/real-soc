@@ -138,9 +138,8 @@ func main() {
 	// Allow in-flight requests up to 10 s to finish.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = shutdownCtx
 
-	if err := app.Shutdown(); err != nil {
+	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 		log.Printf("http shutdown error: %v", err)
 	}
 	w.Stop()
