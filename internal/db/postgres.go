@@ -51,7 +51,7 @@ func New(dsn string) (*Store, error) {
 	// The JSONB columns (agent_cards, tasks, artifacts) are handled by the
 	// custom Scanner/Valuer types defined in models.  We also migrate the
 	// WorkflowStateSnapshot model used for time-machine snapshots.
-	if err := db.AutoMigrate(&models.WorkflowState{}, &models.WorkflowStateSnapshot{}); err != nil {
+	if err := db.AutoMigrate(&models.WorkflowState{}, &models.WorkflowStateSnapshot{}, &models.AgentRecord{}); err != nil {
 		return nil, fmt.Errorf("db: auto-migrate: %w", err)
 	}
 
@@ -157,6 +157,45 @@ func (s *Store) ListAgentCards() ([]models.AgentCard, error) {
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// SaveAgent upserts a persistent AgentRecord into the registry table.
+func (s *Store) SaveAgent(a *models.AgentRecord) error {
+	result := s.db.Save(a)
+	if result.Error != nil {
+		return fmt.Errorf("db: save agent %s: %w", a.AgentID, result.Error)
+	}
+	return nil
+}
+
+// GetAgentByID returns a single AgentRecord by its agent_id.
+func (s *Store) GetAgentByID(id string) (*models.AgentRecord, error) {
+	var rec models.AgentRecord
+	result := s.db.First(&rec, "agent_id = ?", id)
+	if result.Error != nil {
+		return nil, fmt.Errorf("db: get agent %s: %w", id, result.Error)
+	}
+	return &rec, nil
+}
+
+// ListRegisteredAgents returns all agents explicitly registered in the
+// agents table. This provides a reliable registry for the dashboard.
+func (s *Store) ListRegisteredAgents() ([]models.AgentRecord, error) {
+	var recs []models.AgentRecord
+	result := s.db.Find(&recs)
+	if result.Error != nil {
+		return nil, fmt.Errorf("db: list registered agents: %w", result.Error)
+	}
+	return recs, nil
+}
+
+// DeleteAgent removes a registered agent by id.
+func (s *Store) DeleteAgent(id string) error {
+	result := s.db.Delete(&models.AgentRecord{}, "agent_id = ?", id)
+	if result.Error != nil {
+		return fmt.Errorf("db: delete agent %s: %w", id, result.Error)
+	}
+	return nil
 }
 
 // ListPausedForHuman returns all workflow states currently paused and

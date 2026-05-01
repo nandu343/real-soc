@@ -14,9 +14,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/nandu343/real-soc/internal/models"
 	"github.com/nandu343/real-soc/internal/workflow"
 	"go.temporal.io/sdk/client"
@@ -34,6 +37,11 @@ type Store interface {
 	ListAgentCards() ([]models.AgentCard, error)
 	// ListPausedForHuman returns workflow states currently awaiting human input.
 	ListPausedForHuman() ([]models.WorkflowState, error)
+	// Persistent agent registry operations
+	SaveAgent(*models.AgentRecord) error
+	GetAgentByID(string) (*models.AgentRecord, error)
+	ListRegisteredAgents() ([]models.AgentRecord, error)
+	DeleteAgent(string) error
 }
 
 // TemporalClient defines the subset of the Temporal client used by handlers.
@@ -63,9 +71,13 @@ func (h *Handler) Register(app *fiber.App) {
 
 	v1.Get("/health", h.Health)
 	v1.Post("/workflows", h.StartWorkflow)
+	// Allow clients to request an explicit snapshot save for a workflow
+	v1.Post("/workflows/:id/snapshots", h.EmitSnapshot)
+	v1.Post("/webhooks/:workflow/:task/:token", h.WebhookReceiver)
 	v1.Get("/workflows/:id", h.GetWorkflow)
 	v1.Get("/workflows/:id/snapshots", h.ListSnapshots)
 	v1.Get("/agents", h.ListAgents)
+	v1.Post("/agents", h.RegisterAgent)
 	v1.Get("/workflows/:id/query", h.QueryWorkflow)
 	v1.Get("/inbox", h.Inbox)
 	v1.Post("/workflows/:id/approve", h.ApproveStep)
@@ -75,11 +87,49 @@ func (h *Handler) Register(app *fiber.App) {
 
 // ListAgents returns the distinct AgentCard registry discovered in the DB.
 func (h *Handler) ListAgents(c *fiber.Ctx) error {
+	// Prefer explicit registry entries; fall back to discovered cards if empty.
+	regs, err := h.store.ListRegisteredAgents()
+	if err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	if len(regs) > 0 {
+		return c.JSON(regs)
+	}
+
+	// If the registry is empty, return the aggregated agent cards discovered
+	// in existing WorkflowState documents for backwards compatibility.
 	cards, err := h.store.ListAgentCards()
 	if err != nil {
 		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
 	}
 	return c.JSON(cards)
+}
+
+// RegisterAgent accepts an AgentCard-like JSON payload and persists it to the
+// orchestrator registry so the dashboard and other clients can discover it.
+func (h *Handler) RegisterAgent(c *fiber.Ctx) error {
+	var card models.AgentCard
+	if err := c.BodyParser(&card); err != nil {
+		return fiber.NewError(http.StatusBadRequest, "invalid JSON body: "+err.Error())
+	}
+	if card.AgentID == "" {
+		return fiber.NewError(http.StatusBadRequest, "agent_id is required")
+	}
+
+	rec := models.AgentRecord{
+		AgentID:      card.AgentID,
+		Image:        card.Image,
+		Endpoint:     card.Endpoint,
+		Auth:         card.Auth,
+		Type:         card.Type,
+		Capabilities: card.Capabilities,
+		Outbound:     card.Outbound,
+	}
+
+	if err := h.store.SaveAgent(&rec); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	return c.Status(http.StatusCreated).JSON(rec)
 }
 
 // --------------------------------------------------------------------------
@@ -149,6 +199,51 @@ func (h *Handler) StartWorkflow(c *fiber.Ctx) error {
 	// Stamp the workflow ID into the state so it is propagated to all agents.
 	workflowID := fmt.Sprintf("soc-pipeline-%s", req.InitialState.TraceID)
 	req.InitialState.WorkflowID = workflowID
+
+	// Generate webhook URLs for any Start-type tasks and persist into the
+	// task input. This assigns each Start task a unique URL that can be
+	// displayed in the dashboard and used to trigger the run externally.
+	baseURL := os.Getenv("ORCHESTRATOR_BASE_URL")
+	if baseURL == "" {
+		// Fallback to the request host if no explicit base is configured.
+		baseURL = fmt.Sprintf("%s://%s", c.Protocol(), c.Hostname())
+	}
+	for i := range req.InitialState.Tasks {
+		t := &req.InitialState.Tasks[i]
+		if strings.EqualFold(t.AgentID, "start") {
+			// If the dashboard already generated a token for this node (when
+			// it was dragged onto the canvas), reuse that token so the
+			// visible token remains stable. The server will still rewrite
+			// the path to include the concrete workflow ID.
+			var token string
+			if t.Input != nil {
+				if v, ok := t.Input["_webhook_token"]; ok && v != nil {
+					token = fmt.Sprintf("%v", v)
+				}
+			}
+			if token == "" {
+				token = uuid.NewString()
+			}
+			path := fmt.Sprintf("/api/v1/webhooks/%s/%s/%s", workflowID, t.TaskID, token)
+			full := strings.TrimRight(baseURL, "/") + path
+			if t.Input == nil {
+				t.Input = make(map[string]any)
+			}
+			t.Input["_webhook_url"] = full
+			t.Input["_webhook_path"] = path
+			t.Input["_webhook_token"] = token
+			t.Input["_webhook_method"] = "POST"
+		}
+	}
+
+	// Persist the initial workflow state and record an "initial" snapshot
+	// so the dashboard and audit trail show the bootstrapped state.
+	if err := h.store.Save(req.InitialState); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db save error: "+err.Error())
+	}
+	if err := h.store.SaveSnapshot(req.InitialState, req.InitialState.CurrentStep, "initial"); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "failed to save initial snapshot: "+err.Error())
+	}
 
 	opts := client.StartWorkflowOptions{
 		ID:        workflowID,
@@ -256,6 +351,108 @@ func (h *Handler) RestoreSnapshot(c *fiber.Ctx) error {
 		"workflow_id": workflowID,
 		"snapshot_id": req.SnapshotID,
 	})
+}
+
+// EmitSnapshot persists the current latest workflow state as a manual
+// snapshot. This allows the UI to request a checkpoint without running an
+// agent.
+func (h *Handler) EmitSnapshot(c *fiber.Ctx) error {
+	workflowID := c.Params("id")
+	if workflowID == "" {
+		return fiber.NewError(http.StatusBadRequest, "workflow id is required")
+	}
+
+	// Retrieve latest persisted state for this workflow.
+	states, err := h.store.ListByWorkflowID(workflowID)
+	if err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	if len(states) == 0 {
+		return fiber.NewError(http.StatusNotFound, "workflow not found")
+	}
+
+	latest := states[0]
+	if err := h.store.SaveSnapshot(&latest, latest.CurrentStep, "manual"); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "failed to save snapshot: "+err.Error())
+	}
+	return c.JSON(fiber.Map{"status": "snapshot_created", "workflow_id": workflowID})
+}
+
+// WebhookReceiver accepts incoming HTTP requests for Start-type tasks.
+// It validates the per-task token, records the payload into the task's
+// output, persists a snapshot, and signals the running Temporal workflow
+// (best-effort).
+func (h *Handler) WebhookReceiver(c *fiber.Ctx) error {
+	workflowID := c.Params("workflow")
+	taskID := c.Params("task")
+	token := c.Params("token")
+	if workflowID == "" || taskID == "" || token == "" {
+		return fiber.NewError(http.StatusBadRequest, "workflow, task and token are required")
+	}
+
+	// Read body and attempt to parse JSON
+	body := c.Body()
+	var parsed any
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			parsed = map[string]any{"text": string(body)}
+		}
+	} else {
+		parsed = map[string]any{}
+	}
+
+	// Load latest persisted state for this workflow
+	states, err := h.store.ListByWorkflowID(workflowID)
+	if err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db error: "+err.Error())
+	}
+	if len(states) == 0 {
+		return fiber.NewError(http.StatusNotFound, "workflow not found")
+	}
+
+	state := states[0]
+
+	// Find the task
+	idx := -1
+	for i := range state.Tasks {
+		if state.Tasks[i].TaskID == taskID {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return fiber.NewError(http.StatusNotFound, "task not found")
+	}
+
+	// Validate token
+	t := &state.Tasks[idx]
+	tk, _ := t.Input["_webhook_token"].(string)
+	if tk == "" || tk != token {
+		return fiber.NewError(http.StatusForbidden, "invalid webhook token")
+	}
+
+	// Store payload into task output and mark completed
+	if m, ok := parsed.(map[string]any); ok {
+		t.Output = m
+	} else {
+		t.Output = map[string]any{"_raw": parsed}
+	}
+	t.Status = "completed"
+	t.Confidence = 1.0
+	state.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.Save(&state); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "db save error: "+err.Error())
+	}
+	if err := h.store.SaveSnapshot(&state, state.CurrentStep, "webhook"); err != nil {
+		return fiber.NewError(http.StatusInternalServerError, "failed to save webhook snapshot: "+err.Error())
+	}
+
+	// Best-effort: signal the running Temporal workflow that a webhook
+	// payload was received. Workflows may choose to ignore this signal.
+	_ = h.temporalClient.SignalWorkflow(c.Context(), workflowID, "", "WebhookTrigger", map[string]any{"task_id": taskID, "body": parsed})
+
+	return c.JSON(fiber.Map{"status": "ok", "workflow_id": workflowID, "task_id": taskID})
 }
 
 // ApproveStep sends the ApproveStep Temporal signal to a paused workflow.

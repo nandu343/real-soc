@@ -14,8 +14,11 @@ export function generateWorkflow(nodes = [], edges = [], opts = {}){
       agentMap.set(agentId, {
         agent_id: agentId,
         image: node.data?.image || node.image || null,
+        endpoint: node.data?.endpoint || null,
+        auth: node.data?.auth || null,
         capabilities: node.data?.capabilities || [],
         outbound: node.data?.outbound || 'none',
+        type: node.data?.type || 'docker',
       })
     }
   })
@@ -30,14 +33,20 @@ export function generateWorkflow(nodes = [], edges = [], opts = {}){
   const tasks = nodes.map(node => {
     const id = node.id || uuidv4()
     const agentId = node.data?.agentId || node.data?.agent_id || node.agent_id || node.data?.agentID || 'unknown'
+    const baseInput = node.data?.config || node.data?.input || {}
+    // If this node carries remote/http metadata include it in the input so
+    // the remote agent can read method/headers or other per-run settings.
+    if(node.data?.method) baseInput['_method'] = node.data.method
+    if(node.data?.headers) baseInput['_headers'] = node.data.headers
     return {
       task_id: id,
       agent_id: agentId,
       name: node.data?.taskName || node.data?.name || node.name || agentId,
-      input: node.data?.config || node.data?.input || {},
+      input: baseInput,
       status: 'pending',
       confidence: 0.0,
       next: nextFor(id) || '',
+      manual_metadata: node.data?.manualMetadata || node.data?.manual_metadata || undefined,
     }
   })
 

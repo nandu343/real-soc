@@ -23,6 +23,13 @@ type AgentCard struct {
 	AgentID string `json:"agent_id"`
 	// Image is the fully-qualified container image reference (registry/name:tag).
 	Image string `json:"image"`
+	// Endpoint is an optional HTTP endpoint for remote/api agents.
+	// When present and `Type` is "remote" or "api" the orchestrator will
+	// POST the WorkflowState to this URL for execution.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Auth contains optional authentication information for remote agents
+	// (e.g. bearer token or basic auth config). Stored as freeform JSON.
+	Auth map[string]any `json:"auth,omitempty"`
 	// Type indicates how the agent is executed. Supported values:
 	//   - "docker": run as a container via the DockerRunner
 	//   - "human": pause the workflow and wait for a human analyst
