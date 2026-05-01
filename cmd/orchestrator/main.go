@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -63,6 +64,26 @@ func main() {
 		zlog.SugaredWithTrace(context.Background()).Fatalf("failed to create docker runner: %v", err)
 	}
 	zlog.SugaredWithTrace(context.Background()).Infow("docker runner ready", "network", networkName)
+
+	// Optionally start a shared Proxy Agent service so that agents configured
+	// with Outbound=="proxy" may reach external services through this
+	// controlled gateway. Configure with PROXY_AGENT_IMAGE and
+	// PROXY_ALLOWED_HOSTS environment variables.
+	proxyImage := os.Getenv("PROXY_AGENT_IMAGE")
+	if proxyImage != "" {
+		allowed := getenv("PROXY_ALLOWED_HOSTS", "virustotal.com")
+		allowedList := strings.Split(allowed, ",")
+		proxyID, err := dockerRunner.StartProxyService(context.Background(), proxyImage, allowedList)
+		if err != nil {
+			zlog.SugaredWithTrace(context.Background()).Fatalf("failed to start proxy agent: %v", err)
+		}
+		zlog.SugaredWithTrace(context.Background()).Infow("proxy agent started", "container", proxyID)
+		defer func() {
+			if err := dockerRunner.StopProxyService(context.Background()); err != nil {
+				zlog.SugaredWithTrace(context.Background()).Warnf("failed to stop proxy agent: %v", err)
+			}
+		}()
+	}
 
 	// ------------------------------------------------------------------
 	// Temporal client + worker

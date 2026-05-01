@@ -41,12 +41,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/blkiodev"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/nandu343/real-soc/internal/models"
@@ -71,6 +73,9 @@ type DockerRunner struct {
 	cli           *client.Client
 	networkName   string
 	registryToken string // optional bearer token for private registries
+	// proxyContainerID holds the container id of a long-running Proxy Agent
+	// service when one has been started via StartProxyService.
+	proxyContainerID string
 }
 
 // NewDockerRunner creates a DockerRunner that connects to the local Docker
@@ -137,25 +142,13 @@ type AgentRunOutput struct {
 //  7. Cleans up all temporary resources.
 func (r *DockerRunner) RunAgent(ctx context.Context, input AgentRunInput) (AgentRunOutput, error) {
 	// ------------------------------------------------------------------
-	// 1. Serialise current state to a temporary workspace directory.
-	//    A fresh tmpdir is created per invocation so there is no cross-
-	//    contamination between concurrent agent runs.
+	// 1. Serialise current state to an in-memory tar archive which will be
+	//    copied into a size-limited tmpfs inside the container.  Using a
+	//    tmpfs prevents container writes from consuming host disk space.
 	// ------------------------------------------------------------------
-	tmpDir, err := os.MkdirTemp("", "soc-agent-*")
-	if err != nil {
-		return AgentRunOutput{}, fmt.Errorf("runner: create tmpdir: %w", err)
-	}
-	// Always clean up the tmpdir, even on error.
-	defer os.RemoveAll(tmpDir)
-
 	stateBytes, err := json.Marshal(input.State)
 	if err != nil {
 		return AgentRunOutput{}, fmt.Errorf("runner: marshal state: %w", err)
-	}
-
-	statePath := filepath.Join(tmpDir, stateFileName)
-	if err := os.WriteFile(statePath, stateBytes, 0o600); err != nil {
-		return AgentRunOutput{}, fmt.Errorf("runner: write state file: %w", err)
 	}
 
 	// ------------------------------------------------------------------
@@ -168,9 +161,9 @@ func (r *DockerRunner) RunAgent(ctx context.Context, input AgentRunInput) (Agent
 	}
 
 	// ------------------------------------------------------------------
-	// 3. Create the hardened container.
+	// 3. Create the hardened container (with tmpfs workspace).
 	// ------------------------------------------------------------------
-	containerID, err := r.createContainer(ctx, imageRef, tmpDir)
+	containerID, err := r.createContainer(ctx, imageRef, input.AgentCard)
 	if err != nil {
 		return AgentRunOutput{}, err
 	}
@@ -178,13 +171,17 @@ func (r *DockerRunner) RunAgent(ctx context.Context, input AgentRunInput) (Agent
 	// removed even if it is still running after a timeout).
 	defer r.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}) //nolint:errcheck
 
+	// Copy the initial state.json into the container workspace before start.
+	if err := r.copyToContainer(ctx, containerID, stateFileName, stateBytes); err != nil {
+		return AgentRunOutput{}, fmt.Errorf("runner: copy initial state into container: %w", err)
+	}
+
 	// ------------------------------------------------------------------
 	// 4. Start the container and wait for it to finish (with timeout).
 	// ------------------------------------------------------------------
 	if err := r.cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 		return AgentRunOutput{}, fmt.Errorf("runner: start container: %w", err)
 	}
-
 	runCtx, cancel := context.WithTimeout(ctx, containerTimeout)
 	defer cancel()
 
@@ -213,12 +210,7 @@ func (r *DockerRunner) RunAgent(ctx context.Context, input AgentRunInput) (Agent
 	// ------------------------------------------------------------------
 	updatedBytes, err := r.copyFileFromContainer(ctx, containerID, filepath.Join(workspaceDir, stateFileName))
 	if err != nil {
-		// Fall back to the local tmpdir copy in case the agent wrote directly
-		// to the bind-mounted path rather than via ContainerCP.
-		updatedBytes, err = os.ReadFile(statePath)
-		if err != nil {
-			return AgentRunOutput{}, fmt.Errorf("runner: read updated state: %w", err)
-		}
+		return AgentRunOutput{}, fmt.Errorf("runner: read updated state: %w", err)
 	}
 
 	var updatedState models.WorkflowState
@@ -283,16 +275,76 @@ func (r *DockerRunner) pullImage(ctx context.Context, imageRef string) (string, 
 
 // createContainer creates (but does not start) a hardened container with the
 // tmpDir bind-mounted at /workspace inside the container.
-func (r *DockerRunner) createContainer(ctx context.Context, imageRef, tmpDir string) (string, error) {
+func (r *DockerRunner) createContainer(ctx context.Context, imageRef string, agentCard models.AgentCard) (string, error) {
+	// Determine network mode based on agent outbound policy.
+	// Default: internal isolated network (no internet).
+	networkMode := container.NetworkMode(r.networkName)
+	env := []string{"STATE_FILE=" + workspaceDir + "/" + stateFileName}
+
+	// If agent requests proxy access, ensure proxy service is running and
+	// expose PROXY_URL via environment so the agent can use it.
+	if agentCard.Outbound == "proxy" {
+		if r.proxyContainerID == "" {
+			return "", fmt.Errorf("runner: agent %s requested proxy outbound but proxy service is not running", agentCard.AgentID)
+		}
+		env = append(env, "PROXY_URL=http://proxy-agent:8080/forward")
+	}
+
+	// If agent requests direct outbound, only allow when explicitly enabled
+	// via environment variable RUNNER_ALLOW_DIRECT=true to avoid accidental
+	// internet access in secure deployments.
+	if agentCard.Outbound == "direct" {
+		if os.Getenv("RUNNER_ALLOW_DIRECT") != "true" {
+			return "", fmt.Errorf("runner: direct outbound requested by %s but RUNNER_ALLOW_DIRECT is not set", agentCard.AgentID)
+		}
+		networkMode = container.NetworkMode("bridge")
+	}
+
+	// Build cgroup I/O throttles from environment variables (optional).
+	res := container.Resources{
+		Memory:      memoryLimitBytes,
+		NanoCPUs:    nanoCPUs,
+		BlkioWeight: 10,
+	}
+
+	if dev := os.Getenv("RUNNER_BLKIO_DEVICE"); dev != "" {
+		if v := os.Getenv("RUNNER_BLKIO_READ_IOPS"); v != "" {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				res.BlkioDeviceReadIOps = []*blkiodev.ThrottleDevice{{Path: dev, Rate: n}}
+			}
+		}
+		if v := os.Getenv("RUNNER_BLKIO_WRITE_IOPS"); v != "" {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				res.BlkioDeviceWriteIOps = []*blkiodev.ThrottleDevice{{Path: dev, Rate: n}}
+			}
+		}
+		if v := os.Getenv("RUNNER_BLKIO_READ_BPS"); v != "" {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				res.BlkioDeviceReadBps = []*blkiodev.ThrottleDevice{{Path: dev, Rate: n}}
+			}
+		}
+		if v := os.Getenv("RUNNER_BLKIO_WRITE_BPS"); v != "" {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				res.BlkioDeviceWriteBps = []*blkiodev.ThrottleDevice{{Path: dev, Rate: n}}
+			}
+		}
+	}
+
+	// tmpfs size (MB) default 64MB, overridable via RUNNER_TMPFS_SIZE_MB
+	tmpfsMb := 64
+	if v := os.Getenv("RUNNER_TMPFS_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			tmpfsMb = n
+		}
+	}
+
 	resp, err := r.cli.ContainerCreate(
 		ctx,
 		&container.Config{
 			Image: imageRef,
 			// The agent is responsible for reading /workspace/state.json
 			// and writing its result back to the same path.
-			Env: []string{
-				"STATE_FILE=" + workspaceDir + "/" + stateFileName,
-			},
+			Env: env,
 			// Disable attaching a terminal — agents should be headless.
 			AttachStdout: true,
 			AttachStderr: true,
@@ -302,20 +354,11 @@ func (r *DockerRunner) createContainer(ctx context.Context, imageRef, tmpDir str
 			ReadonlyRootfs: true,
 			SecurityOpt:    []string{"no-new-privileges:true"},
 			CapDrop:        []string{"ALL"},
-			NetworkMode:    container.NetworkMode(r.networkName),
-			Resources: container.Resources{
-				Memory:   memoryLimitBytes,
-				NanoCPUs: nanoCPUs,
-			},
-			// Bind-mount the tmpDir as the only writable surface.
-			// The agent can read/write /workspace but nothing else.
-			Mounts: []mount.Mount{
-				{
-					Type:   mount.TypeBind,
-					Source: tmpDir,
-					Target: workspaceDir,
-					// NOT read-only: the agent must be able to overwrite state.json.
-				},
+			// NetworkMode is chosen above based on outbound policy.
+			NetworkMode: networkMode,
+			Resources:   res,
+			Tmpfs: map[string]string{
+				workspaceDir: fmt.Sprintf("size=%dm", tmpfsMb),
 			},
 		},
 		&network.NetworkingConfig{},
@@ -364,6 +407,29 @@ func (r *DockerRunner) copyFileFromContainer(ctx context.Context, containerID, s
 	return io.ReadAll(tr)
 }
 
+// copyToContainer copies a single file into the container at the provided
+// destination directory. The content will appear as destDir/fileName.
+func (r *DockerRunner) copyToContainer(ctx context.Context, containerID, fileName string, content []byte) error {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdr := &tar.Header{
+		Name: fileName,
+		Mode: 0o600,
+		Size: int64(len(content)),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	if _, err := tw.Write(content); err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+
+	return r.cli.CopyToContainer(ctx, containerID, workspaceDir, &buf, container.CopyToContainerOptions{AllowOverwriteDirWithFile: true})
+}
+
 // ensureNetwork creates the isolated Docker bridge network for agent
 // containers if it does not already exist.
 func (r *DockerRunner) ensureNetwork(ctx context.Context) error {
@@ -376,13 +442,75 @@ func (r *DockerRunner) ensureNetwork(ctx context.Context) error {
 		return nil // network already exists
 	}
 
+	// Create an "internal" attachable bridge network so containers can
+	// communicate with each other (e.g. agent <-> proxy) but cannot reach
+	// external networks (host/internet) unless explicitly connected.
 	_, err = r.cli.NetworkCreate(ctx, r.networkName, network.CreateOptions{
 		Driver:     "bridge",
 		Attachable: true,
+		Internal:   true,
 	})
 	if err != nil {
 		return fmt.Errorf("runner: create network %s: %w", r.networkName, err)
 	}
+	return nil
+}
+
+// StartProxyService starts a long-running proxy container that is attached to
+// both the isolated agent network (so agents can reach it) and the default
+// bridge network (so it may access the internet). The proxy will be started
+// detached and its container ID returned.
+func (r *DockerRunner) StartProxyService(ctx context.Context, proxyImage string, allowedHosts []string) (string, error) {
+	// Pull and resolve the image first.
+	imageRef, err := r.pullImage(ctx, proxyImage)
+	if err != nil {
+		return "", fmt.Errorf("runner: pull proxy image: %w", err)
+	}
+
+	// Prepare environment for the proxy container.
+	env := []string{fmt.Sprintf("ALLOWED_HOSTS=%s", strings.Join(allowedHosts, ","))}
+
+	resp, err := r.cli.ContainerCreate(ctx, &container.Config{
+		Image: imageRef,
+		Env:   env,
+	}, &container.HostConfig{
+		// Start on the default bridge network so the proxy has outbound
+		// connectivity; we'll additionally connect it to the isolated
+		// agent network so agents can reach it.
+		NetworkMode: container.NetworkMode("bridge"),
+	}, &network.NetworkingConfig{}, nil, "soc-proxy-agent")
+	if err != nil {
+		return "", fmt.Errorf("runner: create proxy container: %w", err)
+	}
+
+	// Connect the proxy into the isolated agent network so agents can
+	// address it by name / alias from the same network.
+	if err := r.cli.NetworkConnect(ctx, r.networkName, resp.ID, &network.EndpointSettings{Aliases: []string{"proxy-agent"}}); err != nil {
+		// Cleanup the created container on failure.
+		_ = r.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+		return "", fmt.Errorf("runner: connect proxy to agent network: %w", err)
+	}
+
+	if err := r.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		_ = r.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+		return "", fmt.Errorf("runner: start proxy container: %w", err)
+	}
+
+	r.proxyContainerID = resp.ID
+	return resp.ID, nil
+}
+
+// StopProxyService stops and removes the running proxy container started by
+// StartProxyService. It's safe to call multiple times.
+func (r *DockerRunner) StopProxyService(ctx context.Context) error {
+	if r.proxyContainerID == "" {
+		return nil
+	}
+	err := r.cli.ContainerRemove(ctx, r.proxyContainerID, container.RemoveOptions{Force: true})
+	if err != nil {
+		return fmt.Errorf("runner: remove proxy container: %w", err)
+	}
+	r.proxyContainerID = ""
 	return nil
 }
 

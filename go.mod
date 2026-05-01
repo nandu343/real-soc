@@ -5,7 +5,10 @@ go 1.25.0
 require (
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/gofiber/fiber/v2 v2.52.13
+	github.com/google/uuid v1.6.0
+	github.com/hillu/go-yara/v4 v4.3.4
 	go.temporal.io/sdk v1.43.0
+	go.uber.org/zap v1.28.0
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1
 )
@@ -27,7 +30,6 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/mock v1.6.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -64,7 +66,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.temporal.io/api v1.62.11 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect

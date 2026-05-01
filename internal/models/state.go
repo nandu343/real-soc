@@ -27,6 +27,12 @@ type AgentCard struct {
 	Capabilities []string `json:"capabilities"`
 	// MCPTools lists the MCP tool names this agent exposes to the host.
 	MCPTools []string `json:"mcp_tools,omitempty"`
+	// Outbound controls external network access for this agent's container.
+	// Supported values:
+	//   - "none": no internet access (default)
+	//   - "proxy": agent may only reach the configured Proxy Agent
+	//   - "direct": agent has direct outbound network access (discouraged)
+	Outbound string `json:"outbound,omitempty"`
 }
 
 // TaskObject represents a discrete unit of work within the workflow.

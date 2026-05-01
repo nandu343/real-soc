@@ -24,9 +24,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 
 	"github.com/gofiber/fiber/v2"
+
+	memdump "github.com/nandu343/real-soc/internal/tools/memdump"
+	yaraengine "github.com/nandu343/real-soc/internal/tools/yara"
 )
 
 // --------------------------------------------------------------------------
@@ -253,11 +258,87 @@ func RegisterBuiltinTools(r *ToolRegistry) {
 			{Name: "rules_path", Type: "string", Description: "Path to the .yar rules file or directory.", Required: false},
 		},
 		Handler: func(ctx context.Context, params map[string]any) (any, error) {
-			// TODO: exec `yara <rules_path> <target_path>` and parse output.
+			tp, ok := params["target_path"].(string)
+			if !ok || tp == "" {
+				return nil, fmt.Errorf("missing or invalid target_path")
+			}
+			rp := ""
+			if v, ok := params["rules_path"]; ok {
+				if s, ok := v.(string); ok {
+					rp = s
+				}
+			}
+
+			eng := yaraengine.NewEngine()
+			// If rules_path is omitted, look for a local `rules/` directory.
+			if rp == "" {
+				if _, err := os.Stat("rules"); err == nil {
+					rp = "rules"
+				}
+			}
+
+			if rp != "" {
+				if err := eng.CompileRulesFromFile(rp); err != nil {
+					return nil, err
+				}
+			}
+
+			res, err := eng.ScanFile(ctx, tp)
+			if err != nil {
+				return nil, err
+			}
+
+			matched := make([]string, 0, len(res.Matches))
+			for _, m := range res.Matches {
+				matched = append(matched, m.Rule)
+			}
+
 			return map[string]any{
-				"matched_rules": []string{},
-				"scanned_bytes": 0,
-				"status":        "stub — replace with real YARA integration",
+				"matched_rules": matched,
+				"matches":       res.Matches,
+				"scanned_bytes": res.ScannedBytes,
+				"status":        res.Status,
+			}, nil
+		},
+	})
+
+	r.Register(&Tool{
+		Name:        "mem_strings",
+		Description: "Extract printable strings from a memory dump file.",
+		Params: []ToolParam{
+			{Name: "target_path", Type: "string", Description: "Absolute path of the memory dump file.", Required: true},
+			{Name: "min_len", Type: "number", Description: "Minimum string length (default 4).", Required: false},
+		},
+		Handler: func(ctx context.Context, params map[string]any) (any, error) {
+			tp, ok := params["target_path"].(string)
+			if !ok || tp == "" {
+				return nil, fmt.Errorf("missing or invalid target_path")
+			}
+			minLen := 4
+			if v, ok := params["min_len"]; ok {
+				switch n := v.(type) {
+				case float64:
+					minLen = int(n)
+				case int:
+					minLen = n
+				case int64:
+					minLen = int(n)
+				case string:
+					if parsed, err := strconv.Atoi(n); err == nil {
+						minLen = parsed
+					}
+				}
+			}
+
+			strs, err := memdump.ExtractStringsFromFile(tp, minLen)
+			if err != nil {
+				return nil, err
+			}
+
+			return map[string]any{
+				"count":   len(strs),
+				"strings": strs,
+				"status":  "ok",
 			}, nil
 		},
 	})
