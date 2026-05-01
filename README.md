@@ -1,9 +1,9 @@
-# SOC-OS — Local-First Agentic SOC Pipeline
+# Real-SOC — Local-First Agentic SOC Pipeline
 
-SOC-OS replaces AWS cloud services (API Gateway, Lambda, Step Functions) with a
+Real-SOC replaces AWS cloud services (API Gateway, Lambda, Step Functions) with a
 fully local, open-source stack:
 
-| AWS service | SOC-OS equivalent |
+| AWS service | Real-SOC equivalent |
 |---|---|
 | API Gateway | **Go + Fiber** HTTP server |
 | Lambda | **Docker Engine API** (moby/moby) agent containers |
@@ -16,7 +16,7 @@ fully local, open-source stack:
 
 ```
 ┌──────────────┐        ┌───────────────────────────┐
-│  Operator /  │  HTTP  │   SOC-OS Orchestrator      │
+│  Operator /  │  HTTP  │   Real-SOC Orchestrator      │
 │  SIEM alert  │───────▶│  (Go + Fiber, :8080)       │
 └──────────────┘        │                           │
                         │  ┌───────────────────┐    │
@@ -29,7 +29,7 @@ fully local, open-source stack:
                         │  │  Docker Runner     │    │
                         │  │  (agent sandbox)   │    │
                         │  └─────────┬─────────┘    │
-                        │            │ bind-mount    │
+                        │            │ tmpfs-backed  │
                         │  ┌─────────▼─────────┐    │
                         │  │  Agent Container   │    │
                         │  │  /workspace/       │    │
@@ -100,7 +100,7 @@ This starts:
 * **PostgreSQL** on `localhost:5432`
 * **Temporal** on `localhost:7233`
 * **Temporal UI** on `http://localhost:8088`
-* **SOC-OS Orchestrator** on `http://localhost:8080`
+* **Real-SOC Orchestrator** on `http://localhost:8080`
 
 ### 2. Start a workflow run
 
@@ -257,10 +257,79 @@ Each agent container is hardened by the Docker runner:
 | CPU limit | 1 logical CPU (1e9 nanoCPUs) |
 | Memory limit | 512 MB |
 | Image pinning | Resolved to immutable SHA-256 digest before start |
-| Writable surface | Only `/workspace` (bind-mount of a fresh tmpdir) |
+| Writable surface | Only `/workspace` (tmpfs inside the container; size-limited) |
 
 See the package-level docblock in `internal/runner/docker.go` for the full
 rationale.
+
+---
+
+## Traffic Controller & Proxy Agent
+
+By default agent containers run on an internal Docker network with *no
+internet access*. This prevents a malicious or buggy agent from reaching
+external services or filling host disk. Outbound access is controlled in two
+ways:
+
+- Workspace isolation: the runner mounts a size-limited `tmpfs` at
+  `/workspace` for each agent. This prevents container writes from
+  consuming host disk space. The default tmpfs size is `64MB` and is
+  configurable via `RUNNER_TMPFS_SIZE_MB`.
+
+- Outbound policy: each `AgentCard` may set an `outbound` policy with
+  values `none` (default), `proxy`, or `direct`. When set to `proxy`, the
+  orchestrator exposes a controlled Proxy Agent service that forwards only
+  to an allow-list of hosts. When set to `direct`, the container is
+  granted direct bridge-network access only if `RUNNER_ALLOW_DIRECT=true`.
+
+Proxy Agent (recommended for controlled outbound access)
+---------------------------------------
+
+The orchestrator can optionally start a simple Proxy Agent that forwards
+HTTP requests from agents to allowed upstream hosts. Configure it via
+environment variables at startup:
+
+- `PROXY_AGENT_IMAGE` — Docker image for the proxy agent (optional).
+- `PROXY_ALLOWED_HOSTS` — Comma-separated list of allowed hostnames
+  (e.g. `virustotal.com`) for the proxy to forward to.
+
+When a container's `AgentCard.Outbound == "proxy"`, the runner injects
+`PROXY_URL=http://proxy-agent:8080/forward` into the agent environment.
+Agents must POST JSON payloads to this endpoint (see `agents/proxy-agent`
+for example).
+
+Block I/O / IOPS hard limits
+----------------------------
+
+You can apply additional block I/O throttling via environment variables
+when launching the orchestrator. These settings are passed through to
+Docker's cgroup controls and are optional:
+
+- `RUNNER_BLKIO_DEVICE` — the host block device path to throttle
+  (e.g. `/dev/sda`).
+- `RUNNER_BLKIO_READ_IOPS` / `RUNNER_BLKIO_WRITE_IOPS` — maximum IOPS
+  for reads/writes on the device.
+- `RUNNER_BLKIO_READ_BPS` / `RUNNER_BLKIO_WRITE_BPS` — maximum bytes-per-second
+  for reads/writes on the device.
+
+If no device-specific limits are set, the runner sets a conservative
+`BlkioWeight` to limit relative block I/O priority for agent containers.
+
+Environment variables summary (new)
+----------------------------------
+
+| Variable | Default | Description |
+|---|---:|---|
+| `PROXY_AGENT_IMAGE` | _(empty)_ | Optional proxy agent image to start at orchestrator boot |
+| `PROXY_ALLOWED_HOSTS` | `virustotal.com` | Comma-separated allowed hosts for the proxy |
+| `RUNNER_TMPFS_SIZE_MB` | `64` | Size (MB) of the per-agent tmpfs mounted at `/workspace` |
+| `RUNNER_ALLOW_DIRECT` | `false` | If `true`, allows agents with `outbound==direct` to use bridge network |
+| `RUNNER_BLKIO_DEVICE` | _(empty)_ | Block device path for I/O throttling (optional) |
+| `RUNNER_BLKIO_READ_IOPS` | _(empty)_ | Read IOPS limit for the device |
+| `RUNNER_BLKIO_WRITE_IOPS` | _(empty)_ | Write IOPS limit for the device |
+| `RUNNER_BLKIO_READ_BPS` | _(empty)_ | Read bytes-per-second limit for the device |
+| `RUNNER_BLKIO_WRITE_BPS` | _(empty)_ | Write bytes-per-second limit for the device |
+
 
 ---
 
@@ -294,7 +363,7 @@ implementations in `mcp/server.go` with real integrations.
 
 ```bash
 cd agents/hello-world
-docker build -t soc-os/hello-world:latest .
+docker build -t Real-SOC/hello-world:latest .
 
 # Test locally
 echo '{"trace_id":"test","current_step":0,"tasks":[{"task_id":"t1","agent_id":"hello-world","name":"greet","status":"pending","confidence":0,"input":{"counter":0}}],"artifacts":[],"agent_cards":[]}' \
@@ -302,7 +371,7 @@ echo '{"trace_id":"test","current_step":0,"tasks":[{"task_id":"t1","agent_id":"h
 
 docker run --rm \
   -v /tmp/state.json:/workspace/state.json \
-  soc-os/hello-world:latest
+  Real-SOC/hello-world:latest
 
 cat /tmp/state.json | python3 -m json.tool
 ```
