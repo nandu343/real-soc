@@ -24,9 +24,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/gofiber/fiber/v2"
+
+	yaraengine "github.com/nandu343/real-soc/internal/tools/yara"
 )
 
 // --------------------------------------------------------------------------
@@ -253,11 +256,46 @@ func RegisterBuiltinTools(r *ToolRegistry) {
 			{Name: "rules_path", Type: "string", Description: "Path to the .yar rules file or directory.", Required: false},
 		},
 		Handler: func(ctx context.Context, params map[string]any) (any, error) {
-			// TODO: exec `yara <rules_path> <target_path>` and parse output.
+			tp, ok := params["target_path"].(string)
+			if !ok || tp == "" {
+				return nil, fmt.Errorf("missing or invalid target_path")
+			}
+			rp := ""
+			if v, ok := params["rules_path"]; ok {
+				if s, ok := v.(string); ok {
+					rp = s
+				}
+			}
+
+			eng := yaraengine.NewEngine()
+			// If rules_path is omitted, look for a local `rules/` directory.
+			if rp == "" {
+				if _, err := os.Stat("rules"); err == nil {
+					rp = "rules"
+				}
+			}
+
+			if rp != "" {
+				if err := eng.CompileRulesFromFile(rp); err != nil {
+					return nil, err
+				}
+			}
+
+			res, err := eng.ScanFile(ctx, tp)
+			if err != nil {
+				return nil, err
+			}
+
+			matched := make([]string, 0, len(res.Matches))
+			for _, m := range res.Matches {
+				matched = append(matched, m.Rule)
+			}
+
 			return map[string]any{
-				"matched_rules": []string{},
-				"scanned_bytes": 0,
-				"status":        "stub — replace with real YARA integration",
+				"matched_rules": matched,
+				"matches":       res.Matches,
+				"scanned_bytes": res.ScannedBytes,
+				"status":        res.Status,
 			}, nil
 		},
 	})
