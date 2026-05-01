@@ -70,14 +70,19 @@ func main() {
 	// controlled gateway. Configure with PROXY_AGENT_IMAGE and
 	// PROXY_ALLOWED_HOSTS environment variables.
 	proxyImage := os.Getenv("PROXY_AGENT_IMAGE")
+	proxyEnabled := false
+	proxyURL := ""
+	// Pre-compute allowed hosts list so we can include it in the MCP manifest
+	proxyAllowed := getenv("PROXY_ALLOWED_HOSTS", "virustotal.com")
+	proxyAllowedList := strings.Split(proxyAllowed, ",")
 	if proxyImage != "" {
-		allowed := getenv("PROXY_ALLOWED_HOSTS", "virustotal.com")
-		allowedList := strings.Split(allowed, ",")
-		proxyID, err := dockerRunner.StartProxyService(context.Background(), proxyImage, allowedList)
+		proxyID, err := dockerRunner.StartProxyService(context.Background(), proxyImage, proxyAllowedList)
 		if err != nil {
 			zlog.SugaredWithTrace(context.Background()).Fatalf("failed to start proxy agent: %v", err)
 		}
 		zlog.SugaredWithTrace(context.Background()).Infow("proxy agent started", "container", proxyID)
+		proxyEnabled = true
+		proxyURL = "http://proxy-agent:8080/forward"
 		defer func() {
 			if err := dockerRunner.StopProxyService(context.Background()); err != nil {
 				zlog.SugaredWithTrace(context.Background()).Warnf("failed to stop proxy agent: %v", err)
@@ -123,6 +128,13 @@ func main() {
 	toolRegistry := mcp.NewToolRegistry()
 	mcp.RegisterBuiltinTools(toolRegistry)
 	mcpServer := mcp.NewMCPServer(toolRegistry)
+	// Publish runtime info to the MCP manifest so agents can discover host
+	// capabilities (e.g. whether a proxy is available and what its URL is).
+	mcpServer.SetManifestExtras(map[string]any{
+		"proxy_enabled":       proxyEnabled,
+		"proxy_url":           proxyURL,
+		"proxy_allowed_hosts": proxyAllowedList,
+	})
 
 	// ------------------------------------------------------------------
 	// Fiber HTTP server
