@@ -32,6 +32,13 @@ export default function NodePalette(){
     }catch(err){ setLocalAgents([]) }
   },[])
 
+  // Built-in start node for workflows (only has an Out port)
+  const startAgent = { agent_id: 'start', name: 'Start', type: 'start', onlyOut: true, capabilities: ['start'] }
+  // Built-in conditional (if/else) node
+  const conditionalAgent = { agent_id: 'conditional', name: 'If / Else', type: 'conditional', onlyOut: false, capabilities: ['flow'] }
+  // Built-in loop node
+  const loopAgent = { agent_id: 'loop', name: 'Loop', type: 'loop', onlyOut: false, capabilities: ['flow'] }
+
   const saveLocal = (arr)=>{ localStorage.setItem(STORAGE_KEY, JSON.stringify(arr)); setLocalAgents(arr) }
 
   const createAgent = ()=>{
@@ -88,21 +95,20 @@ export default function NodePalette(){
   })()
 
   return (
-    <aside className={`border-r p-3 ${collapsed ? 'w-16' : 'w-72'} bg-amber-50 border-amber-200 transition-all`}>
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <button onClick={()=>setCollapsed(!collapsed)} className="text-sm px-2 py-1 bg-amber-200 border rounded">{collapsed ? '→' : '←'}</button>
+    <aside className={`transition-all ${collapsed ? 'w-20' : 'w-72'}`}>
+      <div className="palette flex items-center justify-between mb-3">
+        <div className="flex items-center gap-3">
+          <button onClick={()=>setCollapsed(!collapsed)} className="text-sm px-2 py-1 bg-white border rounded">{collapsed ? '→' : '←'}</button>
           {!collapsed && <h3 className="font-semibold">Node Palette</h3>}
         </div>
         <div className="flex gap-2">
           {!collapsed && <button onClick={()=>setShowCreate(!showCreate)} className="text-xs px-2 py-1 bg-white border rounded">{showCreate? 'Close':'Create'}</button>}
-          {!collapsed && <button onClick={addHumanQuick} className="text-xs px-2 py-1 bg-amber-100 border rounded">Add Human</button>}
-          {!collapsed && <button onClick={addRemoteQuick} className="text-xs px-2 py-1 bg-indigo-100 border rounded">Add Remote</button>}
+          {!collapsed && <button onClick={addHumanQuick} className="text-xs px-2 py-1 bg-white border rounded text-primary">Add Human</button>}
         </div>
       </div>
 
       {showCreate && !collapsed && (
-        <div className="mb-3 border rounded p-2 bg-amber-50">
+        <div className="mb-3 card">
           <input className="w-full mb-2 p-1 border rounded" placeholder="agent_id" value={form.agent_id} onChange={(e)=>setForm({...form, agent_id: e.target.value})} />
           <input className="w-full mb-2 p-1 border rounded" placeholder="image (optional)" value={form.image} onChange={(e)=>setForm({...form, image: e.target.value})} />
           {(form.type === 'api' || form.type === 'remote') && (
@@ -125,7 +131,7 @@ export default function NodePalette(){
       )}
 
       {!collapsed && (
-      <div className="mb-3 border rounded p-2 bg-amber-50">
+      <div className="mb-3 card">
         <label className="text-xs font-medium">Import from GitHub</label>
         <input className="w-full mb-2 p-1 border rounded" placeholder="https://github.com/owner/repo" value={repoUrl} onChange={(e)=>setRepoUrl(e.target.value)} />
         <div className="flex gap-2">
@@ -146,20 +152,53 @@ export default function NodePalette(){
       )}
 
       <div className={`space-y-2 overflow-auto transition-all ${collapsed ? 'hidden' : ''}`} style={{maxHeight: '60vh'}}>
-        {combined.length===0 && <div className="text-sm text-slate-500">No agents found</div>}
+        {combined.length===0 && <div className="text-sm text-muted">No agents found</div>}
+          {/* Static Start node */}
+          <div key="start-node"
+               draggable
+               onDragStart={(e)=>{ e.dataTransfer.setData('application/json', JSON.stringify(startAgent)); e.dataTransfer.effectAllowed='copy'; }}
+               className="p-3 rounded-lg cursor-grab bg-white hover:shadow-md flex items-center justify-between border border-gray-100">
+            <div>
+              <div className="font-medium">Start</div>
+              <div className="text-xs text-muted">Start node</div>
+            </div>
+            <div className="text-xs text-muted">Out</div>
+          </div>
+          {/* Static Conditional node */}
+          <div key="conditional-node"
+               draggable
+               onDragStart={(e)=>{ e.dataTransfer.setData('application/json', JSON.stringify(conditionalAgent)); e.dataTransfer.effectAllowed='copy'; }}
+               className="p-3 rounded-lg cursor-grab bg-white hover:shadow-md flex items-center justify-between border border-gray-100">
+            <div>
+              <div className="font-medium">If / Else</div>
+              <div className="text-xs text-muted">Conditional</div>
+            </div>
+            <div className="text-xs text-muted">In → Out/Else</div>
+          </div>
+          {/* Static Loop node */}
+          <div key="loop-node"
+               draggable
+               onDragStart={(e)=>{ e.dataTransfer.setData('application/json', JSON.stringify(loopAgent)); e.dataTransfer.effectAllowed='copy'; }}
+               className="p-3 rounded-lg cursor-grab bg-white hover:shadow-md flex items-center justify-between border border-gray-100">
+            <div>
+              <div className="font-medium">Loop</div>
+              <div className="text-xs text-muted">Loop (counter or condition)</div>
+            </div>
+            <div className="text-xs text-muted">In → Out</div>
+          </div>
         {combined.map(a=> (
           <div key={a.agent_id}
                draggable
                onDragStart={(e)=>{ e.dataTransfer.setData('application/json', JSON.stringify(a)); e.dataTransfer.effectAllowed='copy'; }}
-               className="p-2 border rounded cursor-grab bg-amber-50 hover:bg-amber-100 flex items-center justify-between">
+               className="p-3 rounded-lg cursor-grab bg-white hover:shadow-md flex items-center justify-between border border-gray-100">
             <div>
-              <div className="font-medium">{a.agent_id} {a.type === 'human' ? <span className="text-xs text-amber-600">(human)</span> : null}</div>
-              <div className="text-xs text-slate-500 truncate">{(a.capabilities||[]).join(', ')}</div>
+              <div className="font-medium">{a.agent_id} {a.type === 'human' ? <span className="text-xs text-primary">(human)</span> : null}</div>
+              <div className="text-xs text-muted truncate">{(a.capabilities||[]).join(', ')}</div>
             </div>
             {localAgents.find(l=>l.agent_id===a.agent_id) ? (
               <div className="flex flex-col items-end">
                 <button onClick={(e)=>{ e.stopPropagation(); deleteLocal(a.agent_id) }} className="text-xs text-red-600">Delete</button>
-                <div className="text-xs text-slate-400">Local</div>
+                <div className="text-xs text-muted">Local</div>
               </div>
             ) : null}
           </div>

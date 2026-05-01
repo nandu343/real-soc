@@ -251,6 +251,18 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 		}
 		actCtx := workflow.WithActivityOptions(ctx, activityOptions)
 
+		// Expand task inputs by resolving any dot-notation references to
+		// previous task outputs ("name".output.x). This allows tasks to
+		// reference earlier outputs in their input payloads.
+		if err := ExpandInputs(task, state); err != nil {
+			// Log and continue — make expansion failures surface as task errors
+			task.Status = "failed"
+			task.Error = err.Error()
+			state.Status = "failed"
+			_ = persistState(ctx, state)
+			return PipelineOutput{FinalState: state, StepCount: i}, err
+		}
+
 		// Branch for API nodes
 		if strings.EqualFold(card.Type, "api") || strings.EqualFold(card.Type, "http") {
 			var apiOut CallAPIOutput
@@ -311,7 +323,9 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 					return PipelineOutput{FinalState: state, StepCount: i}, err
 				}
 			} else {
-				state = apiOut.UpdatedState
+				// Merge updated state onto our running state so that agents
+				// that return a partial state do not clobber previous outputs.
+				state = MergeWorkflowStates(state, apiOut.UpdatedState)
 				state.CurrentStep = i + 1
 			}
 		} else {
@@ -374,8 +388,9 @@ func AgentPipelineWorkflow(ctx workflow.Context, input PipelineInput) (PipelineO
 				}
 			}
 
-			// Merge the agent's updated state back into our local copy.
-			state = agentOut.UpdatedState
+			// Merge the agent's updated state back into our local copy so
+			// previous task outputs are preserved and new values overlay.
+			state = MergeWorkflowStates(state, agentOut.UpdatedState)
 			state.CurrentStep = i + 1
 		}
 
@@ -512,7 +527,9 @@ func InterpreterWorkflow(ctx workflow.Context, input PipelineInput) (PipelineOut
 		currentTaskID = state.Tasks[0].TaskID
 	}
 
-	visited := make(map[string]bool)
+	// visited tracks how many times we've executed a task id. We allow
+	// revisiting a task when it is explicitly configured as a loop.
+	visited := make(map[string]int)
 	steps := 0
 
 	for currentTaskID != "" {
@@ -524,13 +541,17 @@ func InterpreterWorkflow(ctx workflow.Context, input PipelineInput) (PipelineOut
 			return PipelineOutput{FinalState: state, StepCount: steps}, temporal.NewApplicationError("task id not found: "+currentTaskID, "TaskNotFound")
 		}
 
-		if visited[currentTaskID] {
-			logger.Error("cycle detected in workflow graph", "task_id", currentTaskID)
-			state.Status = "failed"
-			_ = persistState(ctx, state)
-			return PipelineOutput{FinalState: state, StepCount: steps}, temporal.NewApplicationError("cycle detected in graph", "GraphCycle")
+		if visited[currentTaskID] > 0 {
+			// If this task is not configured as a loop, treat revisiting as
+			// a cycle error. Loop tasks are allowed to be re-entered.
+			if !(state.Tasks[idx].Input != nil && state.Tasks[idx].Input["loop"] != nil) {
+				logger.Error("cycle detected in workflow graph", "task_id", currentTaskID)
+				state.Status = "failed"
+				_ = persistState(ctx, state)
+				return PipelineOutput{FinalState: state, StepCount: steps}, temporal.NewApplicationError("cycle detected in graph", "GraphCycle")
+			}
 		}
-		visited[currentTaskID] = true
+		visited[currentTaskID]++
 
 		task := &state.Tasks[idx]
 		task.Status = "running"
@@ -674,8 +695,8 @@ func InterpreterWorkflow(ctx workflow.Context, input PipelineInput) (PipelineOut
 			}
 		}
 
-		// Merge agent state
-		state = agentOut.UpdatedState
+		// Merge agent state (do not clobber previous outputs; overlay them)
+		state = MergeWorkflowStates(state, agentOut.UpdatedState)
 		state.CurrentStep = idx
 
 		// Check confidence
@@ -725,8 +746,92 @@ func InterpreterWorkflow(ctx workflow.Context, input PipelineInput) (PipelineOut
 
 		steps++
 
-		// Determine next
+		// Loop handling: if this task contains a `loop` configuration in its
+		// input, interpret it here and decide whether to repeat (point Next
+		// back to self) or advance to the configured Next task.
 		nextID := state.Tasks[idx].Next
+		if state.Tasks[idx].Input != nil {
+			if lraw, ok := state.Tasks[idx].Input["loop"]; ok {
+				// Expect loop config to be a map[string]any with keys `mode`,
+				// `count` or `condition`.
+				if lcfg, ok2 := lraw.(map[string]any); ok2 {
+					mode := "count"
+					if m, ok3 := lcfg["mode"].(string); ok3 && m != "" {
+						mode = m
+					}
+
+					// Ensure output map exists so we can persist iteration state
+					if state.Tasks[idx].Output == nil {
+						state.Tasks[idx].Output = make(map[string]any)
+					}
+
+					if mode == "count" {
+						// Read configured count (may be float64 from JSON)
+						var maxIter int
+						switch v := lcfg["count"].(type) {
+						case float64:
+							maxIter = int(v)
+						case int:
+							maxIter = v
+						case string:
+							if parsed, err := strconv.Atoi(v); err == nil {
+								maxIter = parsed
+							}
+						default:
+							maxIter = 0
+						}
+						// read current iteration
+						cur := 0
+						if x, ok := state.Tasks[idx].Output["_loop_iter"]; ok {
+							switch vv := x.(type) {
+							case float64:
+								cur = int(vv)
+							case int:
+								cur = vv
+							}
+						}
+						cur++
+						state.Tasks[idx].Output["_loop_iter"] = cur
+
+						if maxIter > 0 && cur < maxIter {
+							// repeat
+							nextID = state.Tasks[idx].TaskID
+						} else {
+							// finished looping — advance to configured Next
+							// (nextID already holds state.Tasks[idx].Next)
+						}
+					} else if mode == "condition" {
+						// condition is expected to be a dot-notated reference
+						// like `"OtherTask".output.some.path` which we can
+						// resolve using ResolveDotReference. If it resolves to
+						// truthy value we repeat; otherwise advance.
+						if condRaw, ok := lcfg["condition"].(string); ok && condRaw != "" {
+							val, rerr := ResolveDotReference(condRaw, state)
+							if rerr == nil {
+								// interpret truthiness
+								doLoop := false
+								switch tv := val.(type) {
+								case bool:
+									doLoop = tv
+								case float64:
+									doLoop = tv != 0
+								case int:
+									doLoop = tv != 0
+								case string:
+									doLoop = tv != "" && tv != "0"
+								default:
+									doLoop = tv != nil
+								}
+								if doLoop {
+									nextID = state.Tasks[idx].TaskID
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		if nextID == "" {
 			// no next -> terminate
 			break

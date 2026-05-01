@@ -23,7 +23,8 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
   const [failedMap, setFailedMap] = useState({})
   const pollRef = useRef(null)
 
-  const latest = workflow || null
+  const [serverWorkflow, setServerWorkflow] = useState(workflow || null)
+  const latest = serverWorkflow || workflow || null
   const prev = (snapshots && snapshots.length>1) ? JSON.parse(snapshots[1].state) : null
   const prevPretty = prev ? JSON.stringify(prev, null, 2) : ''
   const latestPretty = latest ? JSON.stringify(latest, null, 2) : ''
@@ -35,6 +36,10 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
   const [comment, setComment] = useState('')
   const [approveLoading, setApproveLoading] = useState(false)
   const [approveResult, setApproveResult] = useState(null)
+  // Side panels
+  const [leftOpen, setLeftOpen] = useState(false)
+  const [rightOpen, setRightOpen] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
 
   // Handle canvas changes from NodeCanvas
   function handleCanvasChange({ nodes, edges }){
@@ -64,131 +69,40 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
     alert('Saved flow')
   }
 
-  const loadFlow = (f)=>{
-    if(!f) return
-    setCanvasNodes(f.nodes || [])
-    setCanvasEdges(f.edges || [])
-    setShowSaved(false)
-    alert('Loaded flow: '+(f.name||f.id))
-  }
-
-  const deleteFlow = (id)=>{
-    const remaining = (savedFlows || []).filter(s=>s.id!==id)
-    localStorage.setItem('real-soc:flows', JSON.stringify(remaining))
-    setSavedFlows(remaining)
-  }
-
-  const downloadFlow = (f)=>{
-    const blob = new Blob([JSON.stringify(f, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = (f.name || 'flow') + '.json'
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
-  }
-
   async function generateAndStart(){
-    try{
-      const wf = generateWorkflow(canvasNodes, canvasEdges)
-      const res = await fetch('/api/start-workflow', {
-        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ initial_state: wf })
-      })
-      if(!res.ok){
-        const txt = await res.text().catch(()=>null)
-        alert('start failed: '+ (txt || res.status))
-        return
-      }
-      const data = await res.json()
-      const id = data.workflow_id || data.WorkflowID || data.workflowID
-      setRunningWorkflowId(id)
-      // start polling immediately
-      pollOnce(id)
-      alert('workflow started: '+id)
-    }catch(err){
-      alert('start error: '+String(err))
-    }
-  }
-
-  async function emitSnapshot(snapshot){
-    // Start a new workflow run from this snapshot (emit)
-    try{
-      const state = JSON.parse(snapshot.state)
-      const res = await fetch('/api/start-workflow', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ initial_state: state }) })
-      if(!res.ok){ alert('emit failed'); return }
-      const data = await res.json()
-      const id = data.workflow_id || data.WorkflowID || data.workflowID
-      setRunningWorkflowId(id)
-      pollOnce(id)
-      alert('emitted new workflow: '+id)
-    }catch(err){ alert('emit error: '+String(err)) }
-  }
-
-  async function restoreSnapshot(snapshot){
-    try{
-      const res = await fetch('/api/restore-snapshot', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ workflowId: workflowId, snapshotId: snapshot.id, reviewer: 'ui' }) })
-      if(!res.ok){ alert('restore failed'); return }
-      alert('restore signalled')
-    }catch(err){ alert('restore error: '+String(err)) }
-  }
-
-  // Poll once for active task and failed map
-  async function pollOnce(id){
-    try{
-      const r = await fetch(`/api/query-workflow?id=${encodeURIComponent(id)}`)
-      if(!r.ok) return
-      const s = await r.json()
-      if(!s) return
-      const cs = s.current_step ?? s.CurrentStep ?? 0
-      let active = null
-      if(Array.isArray(s.tasks)){
-        const t = s.tasks[cs]
-        if(t) active = t.task_id || t.TaskID || null
-      }
-      setActiveTaskId(active)
-      const fm = {}
-      if(Array.isArray(s.tasks)){
-        s.tasks.forEach(t=>{ const id = t.task_id || t.TaskID; if(t.status === 'failed' || t.error) fm[id] = t.error || 'failed' })
-      }
-      setFailedMap(fm)
-    }catch(err){ /* ignore */ }
-  }
-
-  // Polling effect for Pulse
-  useEffect(()=>{
-    const id = runningWorkflowId || (workflow && (workflow.workflow_id || workflow.WorkflowID || workflow.workflowID))
-    if(!id) return
-    // clear previous
-    if(pollRef.current) clearInterval(pollRef.current)
-    pollRef.current = setInterval(()=>pollOnce(id), 3000)
-    // initial poll
-    pollOnce(id)
-    return ()=>{ if(pollRef.current) clearInterval(pollRef.current) }
-  }, [runningWorkflowId, workflow])
-
-  async function ask(){
     setLoading(true)
-    setChatAnswer(null)
     try{
-      const wid = workflow?.workflow_id || workflow?.WorkflowID || workflow?.workflowId || workflowId
-      if(!wid || wid === 'new'){
-        setChatAnswer('Cannot chat: workflow not started or open a saved workflow first.')
-        setLoading(false)
+      const initial_state = generateWorkflow(canvasNodes, canvasEdges)
+      if(flowName && flowName.trim()!==''){
+        initial_state.workflow_id = flowName.trim()
+      }
+      const res = await fetch('/api/start-workflow', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initial_state })
+      })
+      const data = await res.json().catch(()=>null)
+      if(!res.ok){
+        alert('Failed to start workflow: '+(data?.error || res.status))
         return
       }
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ workflowId: wid, question })
-      })
-      const data = await res.json()
-      setChatAnswer(data.answer)
+      const wid = data?.workflow_id || initial_state.workflow_id
+      setRunningWorkflowId(wid)
+      // Fetch the freshly created workflow state so the UI can display
+      // assigned webhook URLs on Start nodes
+      try{
+        const r2 = await fetch(`/api/get-workflow?id=${encodeURIComponent(wid)}`)
+        if(r2.ok){
+          const js = await r2.json().catch(()=>null)
+          if(js) setServerWorkflow(js)
+        }
+      }catch(err){ /* ignore */ }
+      alert('Workflow started: '+wid)
     }catch(err){
-      setChatAnswer('Error: '+String(err))
-    }finally{setLoading(false)}
+      alert('Error starting workflow: '+String(err))
+    }finally{ setLoading(false) }
   }
+
 
   async function sendApproval(approved){
     if(!reviewer || reviewer.trim()===''){
@@ -223,62 +137,94 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
     }
   }
 
+  async function ask(){
+    setLoading(true)
+    setChatAnswer(null)
+    try{
+      const wid = workflow?.workflow_id || workflow?.WorkflowID || workflow?.workflowId || workflowId
+      if(!wid || wid === 'new'){
+        setChatAnswer('Cannot chat: workflow not started or open a saved workflow first.')
+        setLoading(false)
+        return
+      }
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ workflowId: wid, question })
+      })
+      const data = await res.json().catch(()=>null)
+      setChatAnswer(data?.answer || String(data))
+    }catch(err){
+      setChatAnswer('Error: '+String(err))
+    }finally{setLoading(false)}
+  }
+
+  async function restoreSnapshot(s){
+    try{
+      const res = await fetch('/api/restore-snapshot', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ workflowId: workflow?.workflow_id || workflowId, snapshotId: s.id }) })
+      const data = await res.json().catch(()=>null)
+      if(!res.ok){ alert('Restore failed: '+(data?.error||res.status)); return }
+      alert('Snapshot restored')
+      window.location.reload()
+    }catch(err){ alert('Error: '+String(err)) }
+  }
+
+  async function emitSnapshot(s){
+    try{
+      const wid = workflow?.workflow_id || workflowId
+      const res = await fetch('/api/emit-snapshot', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ workflowId: wid }) })
+      const data = await res.json().catch(()=>null)
+      if(!res.ok){ alert('Emit snapshot failed: '+(data?.error||res.status)); return }
+      alert('Snapshot created')
+      window.location.reload()
+    }catch(err){ alert('Error: '+String(err)) }
+  }
+
   return (
-    <div className="min-h-screen bg-amber-50 p-8 text-slate-800">
+    <div className="min-h-screen bg-gradient-to-b from-surface to-white p-8 text-slate-800">
       <div className="max-w-7xl mx-auto">
         <div className="flex items-center justify-between mb-6">
           <h1 className="text-2xl font-semibold">Workflow: {workflow?.workflow_id || workflow?.WorkflowID || workflow?.workflowID || (workflowId === 'new' ? 'New Flow (unsaved)' : 'unknown')}</h1>
-          <Link href="/" className="text-sm text-amber-700">← Back</Link>
+          <Link href="/" className="text-sm text-primary">← Back</Link>
         </div>
 
-        <div className="flex gap-4">
-          <NodePalette />
-          <div className="flex-1 space-y-6">
-            <div className="flex gap-4">
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-2">
-                  <button onClick={generateAndStart} className="bg-amber-600 text-white px-4 py-2 rounded">Generate & Start</button>
-                  <button onClick={()=>{ navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(generateWorkflow(canvasNodes, canvasEdges), null, 2)); alert('workflow JSON copied') }} className="bg-amber-200 px-3 py-2 rounded">Copy JSON</button>
-                  <div className="text-sm text-slate-500">Tip: click a node then another to connect.</div>
-                </div>
+        <div className="relative">
+          <div className="w-full">
+            <div className="flex items-center gap-2 mb-4">
+              <button onClick={generateAndStart} className="btn-primary">Generate & Start</button>
+              <button onClick={()=>{ navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(generateWorkflow(canvasNodes, canvasEdges), null, 2)); alert('workflow JSON copied') }} className="btn-ghost">Copy JSON</button>
+              <div className="text-sm text-slate-500">Tip: drag agents from the palette, then connect nodes.</div>
+            </div>
 
-                <div className="flex items-center gap-2 mb-4">
-                  <input value={flowName} onChange={(e)=>setFlowName(e.target.value)} placeholder="Flow name" className="border rounded p-2" />
-                  <button onClick={saveFlowToLocal} className="bg-amber-200 px-3 py-2 rounded">Save Flow</button>
-                  <button onClick={()=>setShowSaved(!showSaved)} className="bg-amber-50 border px-3 py-2 rounded">Saved Flows ({savedFlows.length})</button>
-                </div>
+            <div className="w-full h-[calc(100vh-6rem)]">
+              <NodeCanvas initialNodes={canvasNodes} initialEdges={canvasEdges} onChange={handleCanvasChange} activeTaskId={activeTaskId} failedTaskErrors={failedMap} workflow={latest} />
+            </div>
 
-                {showSaved && (
-                  <div className="mb-4 border rounded p-2 bg-white max-h-52 overflow-auto">
-                    {(savedFlows||[]).length===0 && (<div className="text-sm text-slate-500">No saved flows</div>)}
-                    {(savedFlows||[]).map(f => (
-                      <div key={f.id} className="flex items-center justify-between gap-2 p-2 border-b last:border-b-0">
-                        <div className="text-sm">
-                          <div className="font-medium">{f.name}</div>
-                          <div className="text-xs text-slate-500">{f.createdAt}</div>
-                        </div>
-                        <div className="flex gap-2">
-                            <button onClick={()=>loadFlow(f)} className="px-2 py-1 bg-emerald-600 text-white rounded text-sm">Load</button>
-                            <button onClick={()=>downloadFlow(f)} className="px-2 py-1 bg-amber-600 text-white rounded text-sm">Download</button>
-                            <button onClick={()=>deleteFlow(f.id)} className="px-2 py-1 bg-red-600 text-white rounded text-sm">Delete</button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <NodeCanvas initialNodes={canvasNodes} initialEdges={canvasEdges} onChange={handleCanvasChange} activeTaskId={activeTaskId} failedTaskErrors={failedMap} />
+            {/* Left sliding palette */}
+            <div className={`fixed top-0 left-0 bottom-0 z-50 w-80 transform transition-transform duration-300 ${leftOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+              <div className="h-full bg-white shadow-xl p-4">
+                <div className="flex justify-end"><button onClick={()=>setLeftOpen(false)} className="text-sm p-1">✕</button></div>
+                <NodePalette />
               </div>
-              <div className="w-1/2">
-                <section className="mb-6">
-                  <h2 className="font-medium">Current State</h2>
-                  <pre className="mt-2">{latestPretty}</pre>
-                </section>
+            </div>
+          </div>
 
-                <section className="mb-6">
-                  <h2 className="font-medium">Snapshots (Emit / Restore)</h2>
-                  <div className="mt-2 border rounded p-2 bg-amber-50 max-h-48 overflow-auto">
-                    {(!snapshots || snapshots.length===0) && (<div className="text-sm text-slate-500">No snapshots found.</div>)}
+          {/* Floating controls are moved below to avoid stacking/context issues */}
+
+          {/* Bottom drawer console */}
+          <div className={`fixed inset-0 z-40 ${drawerOpen ? 'block' : 'hidden'}`} onClick={()=>setDrawerOpen(false)} />
+          <div className={`fixed left-0 bottom-0 w-full z-50 transition-transform duration-300 ${drawerOpen ? 'translate-y-0' : 'translate-y-full'}`}>
+            <div className="max-w-7xl mx-auto p-6 bg-white/85 backdrop-blur-md rounded-t-3xl shadow-2xl border-t border-gray-200">
+              <div className="flex justify-end"><button onClick={()=>setDrawerOpen(false)} className="text-sm p-1">✕</button></div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="md:col-span-1">
+                  <h3 className="font-medium">Current State</h3>
+                  <pre className="mt-2 max-h-64 overflow-auto bg-white p-3 rounded border">{latestPretty}</pre>
+                </div>
+                <div className="md:col-span-1">
+                  <h3 className="font-medium">Snapshots</h3>
+                  <div className="mt-2 card max-h-64 overflow-auto">
+                    {(!snapshots || snapshots.length===0) && (<div className="text-sm text-slate-500 p-3">No snapshots found.</div>)}
                     {(snapshots||[]).map(s => (
                       <div key={s.id} className="p-2 border-b last:border-b-0 flex items-start justify-between gap-2">
                         <div className="text-xs">
@@ -292,73 +238,43 @@ export default function WorkflowPage({ workflow, snapshots, apiBase, workflowId 
                       </div>
                     ))}
                   </div>
-                </section>
-
-                <section className="mb-6">
-                  <h2 className="font-medium">JSON Diff (previous → current)</h2>
-                    <div className="mt-2 border rounded p-2 bg-amber-50">
-                    {prev ? (
-                      <div style={{width:'100%'}}>
-                        <JsonDiff oldValue={prev} newValue={latest} />
-                      </div>
-                    ) : (
-                      <div className="text-sm text-slate-500">No previous snapshot to diff against.</div>
-                    )}
-                  </div>
-                </section>
-
-                <section className="mb-6">
-                  <h2 className="font-medium">Review & Approve</h2>
-                    <div className="mt-2 border rounded p-4 bg-amber-50">
-                    <div className="grid grid-cols-1 gap-2 md:grid-cols-3 mb-2">
-                      <input value={reviewer} onChange={(e)=>setReviewer(e.target.value)} placeholder="Reviewer name*" className="border rounded p-2" />
-                      <input value={comment} onChange={(e)=>setComment(e.target.value)} placeholder="Comment (optional)" className="border rounded p-2" />
-                      <div className="flex gap-2">
-                        <button onClick={()=>sendApproval(true)} disabled={approveLoading} className="bg-emerald-600 text-white px-4 py-2 rounded">Approve</button>
-                        <button onClick={()=>sendApproval(false)} disabled={approveLoading} className="bg-red-600 text-white px-4 py-2 rounded">Reject</button>
-                        <button onClick={()=>{ setShowEditor(!showEditor); setEditedStateText(latestPretty) }} className="bg-amber-200 px-4 py-2 rounded">{showEditor ? 'Close Editor' : 'Edit State'}</button>
-                      </div>
-                    </div>
-
-                    {showEditor && (
-                      <div className="mt-2">
-                        <label className="block text-sm font-medium mb-1">Edited Workflow State (JSON)</label>
-                        <textarea value={editedStateText} onChange={(e)=>setEditedStateText(e.target.value)} rows={12} className="w-full border rounded p-2 font-mono text-sm" />
-                      </div>
-                    )}
-
-                    {approveLoading && (<div className="mt-2 text-sm text-slate-600">Sending signal...</div>)}
-                    {approveResult && (
-                      <div className="mt-2 p-2 rounded border text-sm">
-                        <div><strong>Result:</strong> {approveResult.ok ? 'ok' : 'failed'} {approveResult.status ? `({approveResult.status})` : ''}</div>
-                        {approveResult.error && (<pre className="mt-1 text-red-600">{approveResult.error}</pre>)}
-                        {approveResult.data && (<pre className="mt-1">{JSON.stringify(approveResult.data, null, 2)}</pre>)}
-                        {approveResult.text && (<pre className="mt-1">{approveResult.text}</pre>)}
-                      </div>
-                    )}
-                  </div>
-                </section>
-
-                <section className="mb-6">
-                  <h2 className="font-medium">Chat with State</h2>
+                </div>
+                <div className="md:col-span-1">
+                  <h3 className="font-medium">Review & Chat</h3>
                   <div className="mt-2">
-                    <textarea value={question} onChange={(e)=>setQuestion(e.target.value)} rows={4} className="w-full border rounded p-2" placeholder="Ask about this workflow state..." />
-                    <div className="flex gap-2 mt-2">
-                      <button onClick={ask} disabled={loading || !question} className="bg-sky-600 text-white px-4 py-2 rounded">{loading ? 'Thinking...' : 'Ask'}</button>
+                    <div className="flex gap-2 mb-2">
+                      <input value={reviewer} onChange={(e)=>setReviewer(e.target.value)} placeholder="Reviewer" className="border rounded p-2 flex-1" />
+                      <input value={comment} onChange={(e)=>setComment(e.target.value)} placeholder="Comment" className="border rounded p-2 w-40" />
                     </div>
-                    {chatAnswer && (
-                      <div className="mt-4">
-                        <h3 className="font-semibold">Answer</h3>
-                        <pre className="mt-2">{chatAnswer}</pre>
-                      </div>
+                    <div className="flex gap-2 mb-2">
+                      <button onClick={()=>sendApproval(true)} disabled={approveLoading} className="bg-emerald-600 text-white px-4 py-2 rounded">Approve</button>
+                      <button onClick={()=>sendApproval(false)} disabled={approveLoading} className="bg-red-600 text-white px-4 py-2 rounded">Reject</button>
+                      <button onClick={()=>{ setShowEditor(!showEditor); setEditedStateText(latestPretty) }} className="bg-amber-200 px-4 py-2 rounded">{showEditor ? 'Close Editor' : 'Edit State'}</button>
+                    </div>
+                    {showEditor && (
+                      <textarea value={editedStateText} onChange={(e)=>setEditedStateText(e.target.value)} rows={6} className="w-full border rounded p-2 font-mono text-sm" />
                     )}
+
+                    <div className="mt-3">
+                      <h4 className="font-medium">Chat</h4>
+                      <textarea value={question} onChange={(e)=>setQuestion(e.target.value)} rows={3} className="w-full border rounded p-2 mt-2" placeholder="Ask about this workflow state..." />
+                      <div className="flex gap-2 mt-2"><button onClick={ask} disabled={loading || !question} className="bg-sky-600 text-white px-4 py-2 rounded">{loading ? 'Thinking...' : 'Ask'}</button></div>
+                      {chatAnswer && (<div className="mt-2"><pre className="p-2 bg-gray-50 rounded">{chatAnswer}</pre></div>)}
+                    </div>
                   </div>
-                </section>
+                </div>
               </div>
             </div>
           </div>
         </div>
       </div>
+
+      {/* Floating controls: palette + console (top-level to avoid stacking context issues) */}
+      <div className="fixed right-6 bottom-6 z-60 flex flex-col items-end gap-3">
+        <button onClick={(e)=>{ e.stopPropagation(); setLeftOpen(prev=>!prev) }} className="bg-white border p-3 rounded-full shadow-lg hover:scale-105 transform transition">☰</button>
+        <button onClick={(e)=>{ e.stopPropagation(); setDrawerOpen(!drawerOpen) }} className="bg-white border p-3 rounded-full shadow-lg hover:scale-105 transform transition">⚙</button>
+      </div>
+
     </div>
   )
 }
